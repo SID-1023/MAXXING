@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="maxxing_accessibility_description">Detects selected apps to enforce your MAXXING focus block list.</string>
+</resources>

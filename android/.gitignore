@@ -1,0 +1,40 @@
+
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+
+# Android / Gradle
+.gradle/
+android/.gradle/
+captures/
+.cxx/
+local.properties
+android/local.properties
+gradle-wrapper.jar
+gradlew
+gradlew.bat
+
+# Android signing keys and credentials
+key.properties
+android/key.properties
+*.jks
+*.keystore
+**/*.jks
+**/*.keystore
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# IDE files
+.idea/
+.vscode/
+
+# Generated files
+GeneratedPluginRegistrant.java
