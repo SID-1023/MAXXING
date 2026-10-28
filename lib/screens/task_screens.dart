@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -340,10 +341,52 @@ class _TasksScreenState extends State<TasksScreen> {
   _TaskFilter _filter = _TaskFilter.all;
   bool _loading = true;
 
+  // Time-based scene state
+  String _taskSceneAsset = 'assets/images/tasks_scene.png';
+  Timer? _taskSceneTimer;
+
   @override
   void initState() {
     super.initState();
+
+    _taskSceneAsset = _getTaskSceneForTime(DateTime.now());
+
+    _taskSceneTimer = Timer.periodic(
+      const Duration(minutes: 1),
+      (_) => _refreshTaskScene(),
+    );
+
     _loadTasks();
+  }
+
+  String _getTaskSceneForTime(DateTime time) {
+    final hour = time.hour;
+
+    if (hour >= 5 && hour < 11) {
+      return 'assets/images/tasks_scene_morning.png';
+    }
+
+    if (hour >= 11 && hour < 16) {
+      return 'assets/images/tasks_scene.png';
+    }
+
+    if (hour >= 16 && hour < 19) {
+      return 'assets/images/tasks_scene_evening.png';
+    }
+
+    return 'assets/images/tasks_scene_night.png';
+  }
+
+  void _refreshTaskScene() {
+    if (!mounted) return;
+
+    final nextScene = _getTaskSceneForTime(DateTime.now());
+
+    if (nextScene != _taskSceneAsset) {
+      setState(() {
+        _taskSceneAsset = nextScene;
+      });
+    }
   }
 
   Future<void> _loadTasks() async {
@@ -543,6 +586,12 @@ class _TasksScreenState extends State<TasksScreen> {
   }
 
   @override
+  void dispose() {
+    _taskSceneTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: _bg,
@@ -567,7 +616,12 @@ class _TasksScreenState extends State<TasksScreen> {
                     sliver: SliverList(
                       delegate: SliverChildListDelegate([
                         _buildHeader(),
-                        const SizedBox(height: 26),
+                        const SizedBox(height: 18),
+
+                        // Unique Tasks page background scene.
+                        _buildQuestScene(),
+
+                        const SizedBox(height: 24),
                         _buildProgressCard(),
                         const SizedBox(height: 28),
                         _buildSectionHeader(),
@@ -648,6 +702,93 @@ class _TasksScreenState extends State<TasksScreen> {
           ),
         ),
       ],
+    );
+  }
+
+  // Unique Tasks page background scene.
+  // Displays the cat-free 4:3 illustrated scene in a rounded card with a
+  // subtle shading gradient and a small QUEST BOARD label.
+  Widget _buildQuestScene() {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(22),
+      child: AspectRatio(
+        aspectRatio: 4 / 3,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 1000),
+              switchInCurve: Curves.easeInOut,
+              switchOutCurve: Curves.easeInOut,
+              layoutBuilder: (currentChild, previousChildren) {
+                return Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    ...previousChildren,
+                    if (currentChild != null) currentChild,
+                  ],
+                );
+              },
+              child: Image.asset(
+                _taskSceneAsset,
+                key: ValueKey<String>(_taskSceneAsset),
+                fit: BoxFit.cover,
+                alignment: Alignment.center,
+                errorBuilder: (context, error, stackTrace) {
+                  return Image.asset(
+                    'assets/images/tasks_scene.png',
+                    fit: BoxFit.cover,
+                    alignment: Alignment.center,
+                    errorBuilder: (context, fallbackError, fallbackStack) {
+                      return const ColoredBox(color: Color(0xFF17132B));
+                    },
+                  );
+                },
+              ),
+            ),
+
+            // Subtle shading to match MAXXING's visual style.
+            const DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    Color(0x33000000),
+                    Color(0x00000000),
+                    Color(0x44000000),
+                  ],
+                ),
+              ),
+            ),
+
+            Positioned(
+              left: 12,
+              top: 12,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 11,
+                  vertical: 8,
+                ),
+                decoration: BoxDecoration(
+                  color: _bg.withValues(alpha: 0.88),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: _border),
+                ),
+                child: const Text(
+                  'QUEST BOARD',
+                  style: TextStyle(
+                    color: _yellow,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: 1,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 

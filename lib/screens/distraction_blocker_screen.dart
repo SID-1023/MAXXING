@@ -1,5 +1,7 @@
+import 'dart:async';
+import 'dart:typed_data';
+import 'package:device_apps_ng/device_apps_ng.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class DistractionBlockerScreen extends StatefulWidget {
@@ -11,38 +13,57 @@ class DistractionBlockerScreen extends StatefulWidget {
 }
 
 class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
-  static const Color background = Color(0xFF09090F);
-  static const Color surface = Color(0xFF15141D);
-  static const Color purple = Color(0xFFB69CFF);
+  // MAXXING theme
+  static const Color background = Color(0xFF17132B);
+  static const Color surface = Color(0xFF241D42);
+  static const Color cream = Color(0xFFF6EFE3);
+  static const Color coral = Color(0xFFFF8A65);
+  static const Color yellow = Color(0xFFFFD66B);
+  static const Color mint = Color(0xFF7ED9B0);
+  static const Color muted = Color(0xFFB9B1D0);
 
+  // Preserve existing preference keys.
   static const String _websitesKey = 'maxxing_blocked_websites';
   static const String _enabledKey = 'maxxing_blocker_enabled';
   static const String _selectedAppsKey = 'maxxing_selected_apps';
 
-  static const MethodChannel _channel = MethodChannel('maxxing/app_blocker');
+  // Packages that must never be blockable (this app + critical system apps).
+  static const Set<String> _hiddenPackages = {
+    'com.example.maxxing',
+    'com.android.systemui',
+    'com.android.settings',
+    'com.android.phone',
+  };
 
   final TextEditingController _websiteController = TextEditingController();
   final TextEditingController _appSearchController = TextEditingController();
 
+  Timer? _searchDebounce;
+
   List<String> _websites = [];
-  List<Map<String, String>> _apps = [];
+
+  // Changed to dynamic to hold Uint8List icons
+  List<Map<String, dynamic>> _apps = [];
   Set<String> _selectedApps = {};
 
   bool _rulesEnabled = false;
-  bool _loading = true;
+  bool _settingsLoaded = false;
   bool _loadingApps = false;
+
   String? _appError;
 
   String get _appSearch => _appSearchController.text.trim().toLowerCase();
 
-  List<Map<String, String>> get _filteredApps {
-    if (_appSearch.isEmpty) return _apps;
+  List<Map<String, dynamic>> get _filteredApps {
+    final query = _appSearch;
+
+    if (query.isEmpty) return _apps;
 
     return _apps.where((app) {
-      final name = (app['name'] ?? '').toLowerCase();
-      final packageName = (app['packageName'] ?? '').toLowerCase();
+      final name = (app['name'] ?? '').toString().toLowerCase();
+      final packageName = (app['packageName'] ?? '').toString().toLowerCase();
 
-      return name.contains(_appSearch) || packageName.contains(_appSearch);
+      return name.contains(query) || packageName.contains(query);
     }).toList();
   }
 
@@ -50,6 +71,13 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
   void initState() {
     super.initState();
     _loadSettings();
+  }
+
+  void _onSearchChanged(String _) {
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 300), () {
+      if (mounted) setState(() {});
+    });
   }
 
   Future<void> _loadSettings() async {
@@ -62,16 +90,27 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
         _websites = prefs.getStringList(_websitesKey) ?? [];
         _rulesEnabled = prefs.getBool(_enabledKey) ?? false;
         _selectedApps = (prefs.getStringList(_selectedAppsKey) ?? []).toSet();
-        _loading = false;
+        _settingsLoaded = true;
       });
+    } catch (error) {
+      debugPrint('MAXXING: Could not load blocker settings: $error');
 
-      await _loadApps();
-    } catch (e) {
       if (!mounted) return;
 
-      setState(() => _loading = false);
+      setState(() {
+        _settingsLoaded = true;
+      });
+
       _showMessage('Could not load saved settings.');
     }
+
+    if (!mounted) return;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _loadApps();
+      }
+    });
   }
 
   Future<void> _loadApps() async {
@@ -82,24 +121,31 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
       _appError = null;
     });
 
-    try {
-      final result = await _channel.invokeMethod<List<dynamic>>(
-        'getLaunchableApps',
-      );
+    final stopwatch = Stopwatch()..start();
 
-      final loadedApps = (result ?? [])
-          .whereType<Map>()
-          .map((item) {
-            return <String, String>{
-              'name': item['name']?.toString() ?? 'Unknown app',
-              'packageName': item['packageName']?.toString() ?? '',
+    try {
+      final List<Application> installedApps =
+          await DeviceApps.getInstalledApplications(
+            includeAppIcons: true,
+            includeSystemApps: true,
+            onlyAppsWithLaunchIntent: true,
+          );
+
+      final loadedApps = installedApps
+          .where((app) => !_hiddenPackages.contains(app.packageName))
+          .map((app) {
+            return <String, dynamic>{
+              'name': app.appName,
+              'packageName': app.packageName,
+              'icon': app is ApplicationWithIcon ? app.icon : null,
             };
           })
-          .where((app) => app['packageName']!.isNotEmpty)
           .toList();
 
       loadedApps.sort(
-        (a, b) => a['name']!.toLowerCase().compareTo(b['name']!.toLowerCase()),
+        (a, b) => a['name'].toString().toLowerCase().compareTo(
+          b['name'].toString().toLowerCase(),
+        ),
       );
 
       if (!mounted) return;
@@ -109,25 +155,24 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
         _loadingApps = false;
       });
 
+      stopwatch.stop();
+      debugPrint(
+        'MAXXING: Loaded ${loadedApps.length} apps '
+        'in ${stopwatch.elapsedMilliseconds} ms.',
+      );
+
       if (loadedApps.isEmpty) {
-        _showMessage(
-          'No launchable apps found. Check Android app discovery settings.',
-        );
+        _showMessage('No apps with a launcher icon were returned.');
       }
-    } on PlatformException catch (e) {
+    } catch (error) {
       if (!mounted) return;
 
       setState(() {
         _loadingApps = false;
-        _appError = '${e.code}: ${e.message ?? 'Unable to load apps.'}';
+        _appError = 'Could not load installed apps: $error';
       });
-    } catch (e) {
-      if (!mounted) return;
 
-      setState(() {
-        _loadingApps = false;
-        _appError = 'Could not load installed apps: $e';
-      });
+      debugPrint('MAXXING app loading failed: $error');
     }
   }
 
@@ -138,10 +183,13 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
 
   Future<void> _saveSelectedApps() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList(_selectedAppsKey, _selectedApps.toList()..sort());
+    final saved = _selectedApps.toList()..sort();
+    await prefs.setStringList(_selectedAppsKey, saved);
   }
 
   Future<void> _toggleApp(String packageName, bool selected) async {
+    final previousSelection = Set<String>.from(_selectedApps);
+
     setState(() {
       if (selected) {
         _selectedApps.add(packageName);
@@ -152,7 +200,15 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
 
     try {
       await _saveSelectedApps();
-    } catch (_) {
+    } catch (error) {
+      debugPrint('MAXXING: Could not save app selection: $error');
+
+      if (!mounted) return;
+
+      setState(() {
+        _selectedApps = previousSelection;
+      });
+
       _showMessage('Could not save app selection.');
     }
   }
@@ -179,7 +235,7 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
     ).hasMatch(domain);
 
     if (!validDomain) {
-      _showMessage('Enter a valid domain, e.g. instagram.com');
+      _showMessage('Enter a valid domain, such as instagram.com.');
       return;
     }
 
@@ -188,50 +244,105 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
       return;
     }
 
+    final previousWebsites = List<String>.from(_websites);
+
     setState(() {
-      _websites.insert(0, domain);
+      _websites = [domain, ..._websites];
       _websiteController.clear();
     });
 
-    await _saveWebsites();
+    try {
+      await _saveWebsites();
 
-    if (mounted) _showMessage('Website added to your list.');
+      if (mounted) {
+        _showMessage('Website added to your list.');
+      }
+    } catch (error) {
+      debugPrint('MAXXING: Could not save website: $error');
+
+      if (!mounted) return;
+
+      setState(() {
+        _websites = previousWebsites;
+      });
+
+      _showMessage('Could not save the website.');
+    }
   }
 
   Future<void> _removeWebsite(String domain) async {
-    setState(() => _websites.remove(domain));
-    await _saveWebsites();
+    final previousWebsites = List<String>.from(_websites);
+
+    setState(() {
+      _websites = _websites.where((site) => site != domain).toList();
+    });
+
+    try {
+      await _saveWebsites();
+    } catch (error) {
+      debugPrint('MAXXING: Could not remove website: $error');
+
+      if (!mounted) return;
+
+      setState(() {
+        _websites = previousWebsites;
+      });
+
+      _showMessage('Could not update the website list.');
+    }
   }
 
   Future<void> _setRulesEnabled(bool value) async {
-    setState(() => _rulesEnabled = value);
+    final previousValue = _rulesEnabled;
 
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_enabledKey, value);
+    setState(() {
+      _rulesEnabled = value;
+    });
 
-    if (mounted) {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_enabledKey, value);
+
+      if (!mounted) return;
+
       _showMessage(
         value
-            ? 'List enabled. Actual blocking is not connected yet.'
-            : 'List disabled.',
+            ? 'Block-list setting saved. Verify Android enforcement.'
+            : 'Block-list setting disabled.',
       );
+    } catch (error) {
+      debugPrint('MAXXING: Could not save blocker setting: $error');
+
+      if (!mounted) return;
+
+      setState(() {
+        _rulesEnabled = previousValue;
+      });
+
+      _showMessage('Could not save the blocker setting.');
     }
   }
 
   void _showMessage(String message) {
     if (!mounted) return;
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: surface,
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: surface,
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+        ),
+      );
   }
 
   @override
   void dispose() {
+    _searchDebounce?.cancel();
     _websiteController.dispose();
     _appSearchController.dispose();
     super.dispose();
@@ -243,116 +354,226 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
       backgroundColor: background,
       appBar: AppBar(
         backgroundColor: background,
-        foregroundColor: Colors.white,
+        foregroundColor: cream,
         elevation: 0,
-        title: const Text(
-          'Distraction Blocker',
-          style: TextStyle(fontWeight: FontWeight.w700),
-        ),
-      ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator(color: purple))
-          : SafeArea(
-              child: ListView(
-                padding: const EdgeInsets.all(20),
-                children: [
-                  _buildHeroCard(),
-                  const SizedBox(height: 22),
-                  _sectionTitle('WEBSITE BLOCK LIST'),
-                  const SizedBox(height: 12),
-                  _buildWebsiteInput(),
-                  const SizedBox(height: 12),
-                  _buildSuggestions(),
-                  const SizedBox(height: 16),
-                  if (_websites.isEmpty)
-                    _buildEmptyState()
-                  else
-                    ..._websites.map(_buildWebsiteTile),
-                  const SizedBox(height: 22),
-                  _sectionTitle('APP BLOCKING'),
-                  const SizedBox(height: 12),
-                  _buildAppSelector(),
-                  const SizedBox(height: 20),
-                  const Text(
-                    'Your selections are saved on this device. '
-                    'App restrictions and website filtering are not '
-                    'enforced yet and require additional Android integration.',
-                    style: TextStyle(
-                      color: Colors.white54,
-                      height: 1.5,
-                      fontSize: 12,
-                    ),
-                  ),
-                ],
+        titleSpacing: 18,
+        title: Row(
+          children: [
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: surface,
+                borderRadius: BorderRadius.circular(13),
+              ),
+              child: const Icon(
+                Icons.shield_moon_rounded,
+                color: yellow,
+                size: 24,
               ),
             ),
+            const SizedBox(width: 11),
+            const Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'MAXXING',
+                  style: TextStyle(
+                    color: cream,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: 1.5,
+                  ),
+                ),
+                Text(
+                  'DISTRACTION BLOCKER',
+                  style: TextStyle(
+                    color: muted,
+                    fontSize: 9,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.2,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(18, 10, 18, 28),
+          children: [
+            _buildHeader(),
+            const SizedBox(height: 18),
+            _buildDistractionBlockerScene(),
+            const SizedBox(height: 20),
+            _buildOverviewStats(),
+            const SizedBox(height: 16),
+            _buildProtectionCard(),
+            const SizedBox(height: 27),
+            _buildSectionHeading(
+              'WEBSITE SHIELD',
+              'Choose websites to avoid',
+              Icons.language_rounded,
+              coral,
+            ),
+            const SizedBox(height: 14),
+            _buildWebsiteInput(),
+            const SizedBox(height: 12),
+            _buildSuggestions(),
+            const SizedBox(height: 14),
+            if (_websites.isEmpty)
+              _buildEmptyWebsites()
+            else
+              ..._websites.map(_buildWebsiteTile),
+            const SizedBox(height: 27),
+            _buildSectionHeading(
+              'APP SHIELD',
+              'Choose apps that distract you',
+              Icons.phonelink_lock_rounded,
+              mint,
+            ),
+            const SizedBox(height: 14),
+            _buildAppSelector(),
+            const SizedBox(height: 20),
+            _buildFooterNote(),
+          ],
+        ),
+      ),
     );
   }
 
-  Widget _buildHeroCard() {
-    return Container(
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(24),
-        gradient: const LinearGradient(
-          colors: [Color(0xFF29203D), Color(0xFF171520)],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
+  Widget _buildDistractionBlockerScene() {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(22),
+      child: AspectRatio(
+        aspectRatio: 4 / 3,
+        child: Image.asset(
+          'assets/images/distraction_blocker_scene.png',
+          width: double.infinity,
+          fit: BoxFit.cover,
+          alignment: Alignment.center,
+          errorBuilder: (context, error, stackTrace) {
+            return const ColoredBox(
+              color: Color(0xFF17132B),
+              child: Center(
+                child: Icon(
+                  Icons.image_not_supported_outlined,
+                  color: Color(0xFFFFD66B),
+                  size: 32,
+                ),
+              ),
+            );
+          },
         ),
-        border: Border.all(color: purple.withValues(alpha: 0.25)),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+    );
+  }
+
+  Widget _buildHeader() {
+    return const Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'TAKE BACK YOUR TIME',
+          style: TextStyle(
+            color: yellow,
+            fontSize: 10,
+            fontWeight: FontWeight.w900,
+            letterSpacing: 2,
+          ),
+        ),
+        SizedBox(height: 9),
+        Text(
+          'Block distractions.',
+          style: TextStyle(
+            color: cream,
+            fontSize: 28,
+            height: 1.1,
+            fontWeight: FontWeight.w900,
+          ),
+        ),
+        SizedBox(height: 7),
+        Text(
+          'Build a quieter digital space and make room for what matters.',
+          style: TextStyle(color: muted, fontSize: 13, height: 1.5),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildOverviewStats() {
+    return Row(
+      children: [
+        Expanded(
+          child: _statCard(
+            icon: Icons.apps_rounded,
+            value: '${_selectedApps.length}',
+            label: 'SELECTED APPS',
+            accent: mint,
+          ),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: _statCard(
+            icon: Icons.language_rounded,
+            value: '${_websites.length}',
+            label: 'WEBSITES',
+            accent: coral,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _statCard({
+    required IconData icon,
+    required String value,
+    required String label,
+    required Color accent,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: surface,
+        borderRadius: BorderRadius.circular(19),
+        border: Border.all(color: accent.withValues(alpha: 0.18)),
+      ),
+      child: Row(
         children: [
-          const Icon(Icons.shield_moon_outlined, color: purple, size: 34),
-          const SizedBox(height: 16),
-          const Text(
-            'Protect your focus.',
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: 23,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-          const SizedBox(height: 8),
-          const Text(
-            'Build a distraction-free environment '
-            'for your next deep-work session.',
-            style: TextStyle(color: Colors.white70, height: 1.5),
-          ),
-          const SizedBox(height: 18),
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            width: 40,
+            height: 40,
             decoration: BoxDecoration(
-              color: Colors.black.withValues(alpha: 0.18),
-              borderRadius: BorderRadius.circular(14),
+              color: accent.withValues(alpha: 0.13),
+              borderRadius: BorderRadius.circular(13),
             ),
-            child: Row(
+            child: Icon(icon, color: accent, size: 21),
+          ),
+          const SizedBox(width: 9),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Icon(Icons.toggle_on, color: purple, size: 30),
-                const SizedBox(width: 10),
-                const Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Block list',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      Text(
-                        'Saved rules only — filtering not connected',
-                        style: TextStyle(color: Colors.white54, fontSize: 11),
-                      ),
-                    ],
+                Text(
+                  value,
+                  style: const TextStyle(
+                    color: cream,
+                    fontSize: 22,
+                    fontWeight: FontWeight.w900,
                   ),
                 ),
-                Switch(
-                  value: _rulesEnabled,
-                  activeThumbColor: purple,
-                  onChanged: _setRulesEnabled,
+                const SizedBox(height: 2),
+                Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: muted,
+                    fontSize: 8,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 0.4,
+                  ),
                 ),
               ],
             ),
@@ -362,15 +583,137 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
     );
   }
 
-  Widget _sectionTitle(String text) {
-    return Text(
-      text,
-      style: const TextStyle(
-        color: Colors.white60,
-        fontSize: 11,
-        letterSpacing: 1.5,
-        fontWeight: FontWeight.w700,
+  Widget _buildProtectionCard() {
+    final active = _rulesEnabled;
+
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(24),
+        gradient: LinearGradient(
+          colors: active
+              ? const [Color(0xFF30453F), surface]
+              : const [Color(0xFF393057), surface],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        border: Border.all(
+          color: (active ? mint : yellow).withValues(alpha: 0.30),
+        ),
       ),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 53,
+                height: 53,
+                decoration: BoxDecoration(
+                  color: (active ? mint : yellow).withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Icon(
+                  active ? Icons.shield_rounded : Icons.shield_outlined,
+                  color: active ? mint : yellow,
+                  size: 29,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      active ? 'Block-list is ON' : 'Block-list is OFF',
+                      style: const TextStyle(
+                        color: cream,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                    const SizedBox(height: 5),
+                    Text(
+                      active
+                          ? 'Your saved setting is enabled.'
+                          : 'Choose your rules before focusing.',
+                      style: const TextStyle(
+                        color: muted,
+                        fontSize: 11,
+                        height: 1.4,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Switch.adaptive(
+                value: active,
+                activeTrackColor: mint,
+                onChanged: _setRulesEnabled,
+              ),
+            ],
+          ),
+          const SizedBox(height: 15),
+          Divider(color: Colors.white.withValues(alpha: 0.09), height: 1),
+          const SizedBox(height: 13),
+          const Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(Icons.info_outline_rounded, color: yellow, size: 17),
+              SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'This switch saves your block-list setting. '
+                  'Actual Android enforcement must be configured and verified.',
+                  style: TextStyle(color: muted, fontSize: 10, height: 1.5),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSectionHeading(
+    String title,
+    String subtitle,
+    IconData icon,
+    Color accent,
+  ) {
+    return Row(
+      children: [
+        Container(
+          width: 42,
+          height: 42,
+          decoration: BoxDecoration(
+            color: surface,
+            borderRadius: BorderRadius.circular(14),
+          ),
+          child: Icon(icon, color: accent, size: 22),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: const TextStyle(
+                  color: cream,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 0.8,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                subtitle,
+                style: const TextStyle(color: muted, fontSize: 11),
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 
@@ -380,41 +723,56 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
         Expanded(
           child: TextField(
             controller: _websiteController,
-            style: const TextStyle(color: Colors.white),
+            style: const TextStyle(color: cream, fontSize: 13),
             keyboardType: TextInputType.url,
             textInputAction: TextInputAction.done,
             onSubmitted: (_) => _addWebsite(),
             decoration: InputDecoration(
-              hintText: 'e.g. instagram.com',
-              hintStyle: const TextStyle(color: Colors.white38),
+              hintText: 'Enter a website domain...',
+              hintStyle: const TextStyle(color: muted, fontSize: 12),
+              prefixIcon: const Icon(
+                Icons.language_rounded,
+                color: coral,
+                size: 20,
+              ),
               filled: true,
               fillColor: surface,
               contentPadding: const EdgeInsets.symmetric(
-                horizontal: 16,
-                vertical: 15,
+                horizontal: 14,
+                vertical: 16,
               ),
               border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(14),
+                borderRadius: BorderRadius.circular(16),
                 borderSide: BorderSide.none,
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide(
+                  color: Colors.white.withValues(alpha: 0.06),
+                ),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: const BorderSide(color: coral, width: 1.3),
               ),
             ),
           ),
         ),
-        const SizedBox(width: 10),
+        const SizedBox(width: 9),
         SizedBox(
-          height: 52,
           width: 52,
+          height: 52,
           child: FilledButton(
             onPressed: _addWebsite,
             style: FilledButton.styleFrom(
-              backgroundColor: purple,
+              backgroundColor: coral,
               foregroundColor: background,
               padding: EdgeInsets.zero,
               shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(14),
+                borderRadius: BorderRadius.circular(16),
               ),
             ),
-            child: const Icon(Icons.add, size: 25),
+            child: const Icon(Icons.add_rounded, size: 27),
           ),
         ),
       ],
@@ -424,52 +782,67 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
   Widget _buildSuggestions() {
     const suggestions = [
       'instagram.com',
+      'youtube.com',
       'reddit.com',
       'tiktok.com',
       'facebook.com',
     ];
 
+    final availableSuggestions = suggestions
+        .where((site) => !_websites.contains(site))
+        .toList();
+
     return Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      children: suggestions
-          .where((site) => !_websites.contains(site))
-          .map(
-            (site) => ActionChip(
-              label: Text(site),
-              labelStyle: const TextStyle(color: Colors.white70, fontSize: 12),
-              backgroundColor: surface,
-              side: BorderSide.none,
-              onPressed: () async {
-                _websiteController.text = site;
-                await _addWebsite();
-              },
-            ),
-          )
-          .toList(),
+      spacing: 7,
+      runSpacing: 7,
+      children: availableSuggestions.map((site) {
+        return ActionChip(
+          avatar: const Icon(Icons.add_rounded, color: coral, size: 15),
+          label: Text(site),
+          labelStyle: const TextStyle(
+            color: cream,
+            fontSize: 10,
+            fontWeight: FontWeight.w700,
+          ),
+          backgroundColor: surface,
+          side: BorderSide(color: Colors.white.withValues(alpha: 0.06)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+          onPressed: () async {
+            _websiteController.text = site;
+            await _addWebsite();
+          },
+        );
+      }).toList(),
     );
   }
 
-  Widget _buildEmptyState() {
+  Widget _buildEmptyWebsites() {
     return Container(
-      padding: const EdgeInsets.all(22),
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 23),
       decoration: BoxDecoration(
         color: surface,
-        borderRadius: BorderRadius.circular(18),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
       ),
       child: const Column(
         children: [
-          Icon(Icons.public, color: purple, size: 32),
+          Icon(Icons.travel_explore_rounded, color: coral, size: 34),
           SizedBox(height: 10),
           Text(
-            'Your list is empty',
-            style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+            'Your website shield is empty',
+            style: TextStyle(
+              color: cream,
+              fontSize: 13,
+              fontWeight: FontWeight.w800,
+            ),
           ),
-          SizedBox(height: 5),
+          SizedBox(height: 6),
           Text(
-            'Add a website you want to avoid.',
+            'Add distracting websites above to build your personal list.',
             textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.white54),
+            style: TextStyle(color: muted, height: 1.5, fontSize: 11),
           ),
         ],
       ),
@@ -478,37 +851,52 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
 
   Widget _buildWebsiteTile(String domain) {
     return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      margin: const EdgeInsets.only(bottom: 9),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
         color: surface,
-        borderRadius: BorderRadius.circular(14),
+        borderRadius: BorderRadius.circular(17),
+        border: Border.all(color: coral.withValues(alpha: 0.12)),
       ),
       child: Row(
         children: [
           Container(
-            height: 38,
-            width: 38,
+            width: 40,
+            height: 40,
             decoration: BoxDecoration(
-              color: purple.withValues(alpha: 0.12),
-              borderRadius: BorderRadius.circular(11),
+              color: coral.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(13),
             ),
-            child: const Icon(Icons.language, color: purple, size: 20),
+            child: const Icon(Icons.language_rounded, color: coral, size: 21),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: 11),
           Expanded(
-            child: Text(
-              domain,
-              style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.w500,
-              ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  domain,
+                  style: const TextStyle(
+                    color: cream,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  'On your website list',
+                  style: TextStyle(color: muted, fontSize: 10),
+                ),
+              ],
             ),
           ),
           IconButton(
             tooltip: 'Remove website',
             onPressed: () => _removeWebsite(domain),
-            icon: const Icon(Icons.delete_outline, color: Colors.white54),
+            style: IconButton.styleFrom(
+              backgroundColor: coral.withValues(alpha: 0.09),
+            ),
+            icon: const Icon(Icons.close_rounded, color: coral, size: 19),
           ),
         ],
       ),
@@ -516,151 +904,134 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
   }
 
   Widget _buildAppSelector() {
+    final filteredApps = _filteredApps;
+
     return Container(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(15),
       decoration: BoxDecoration(
         color: surface,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: Colors.white10),
+        borderRadius: BorderRadius.circular(23),
+        border: Border.all(color: mint.withValues(alpha: 0.15)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              const Icon(Icons.phonelink_lock, color: purple, size: 28),
-              const SizedBox(width: 12),
               Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Choose distracting apps',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      '${_selectedApps.length} app(s) selected',
-                      style: const TextStyle(
-                        color: Colors.white54,
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
+                child: Text(
+                  '${_selectedApps.length} apps selected',
+                  style: const TextStyle(
+                    color: cream,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w900,
+                  ),
                 ),
               ),
               IconButton(
                 tooltip: 'Refresh installed apps',
                 onPressed: _loadingApps ? null : _loadApps,
-                icon: const Icon(Icons.refresh, color: purple),
+                icon: const Icon(Icons.refresh_rounded, color: mint),
               ),
             ],
           ),
-          const SizedBox(height: 14),
+          const SizedBox(height: 3),
+          const Text(
+            'Choose the apps you want to stay away from.',
+            style: TextStyle(color: muted, fontSize: 11, height: 1.4),
+          ),
+          const SizedBox(height: 15),
           TextField(
             controller: _appSearchController,
-            onChanged: (_) => setState(() {}),
-            style: const TextStyle(color: Colors.white),
+            onChanged: _onSearchChanged,
+            style: const TextStyle(color: cream, fontSize: 13),
             decoration: InputDecoration(
-              hintText: 'Search installed apps',
-              hintStyle: const TextStyle(color: Colors.white38),
-              prefixIcon: const Icon(Icons.search, color: Colors.white54),
+              hintText: 'Search installed apps...',
+              hintStyle: const TextStyle(color: muted, fontSize: 12),
+              prefixIcon: const Icon(Icons.search_rounded, color: mint),
               suffixIcon: _appSearchController.text.isEmpty
                   ? null
                   : IconButton(
                       onPressed: () {
+                        _searchDebounce?.cancel();
                         _appSearchController.clear();
                         setState(() {});
                       },
-                      icon: const Icon(Icons.close, color: Colors.white54),
+                      icon: const Icon(Icons.close_rounded, color: muted),
                     ),
               filled: true,
               fillColor: background,
+              contentPadding: const EdgeInsets.symmetric(vertical: 14),
               border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(15),
                 borderSide: BorderSide.none,
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(15),
+                borderSide: BorderSide(
+                  color: Colors.white.withValues(alpha: 0.05),
+                ),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(15),
+                borderSide: const BorderSide(color: mint, width: 1.2),
               ),
             ),
           ),
           const SizedBox(height: 12),
-          if (_loadingApps)
-            const Padding(
-              padding: EdgeInsets.all(20),
-              child: Center(child: CircularProgressIndicator(color: purple)),
-            )
+
+          if (!_settingsLoaded || _loadingApps)
+            _buildAppLoadingState()
           else if (_appError != null)
             _buildAppError()
           else if (_apps.isEmpty)
             _buildNoApps()
-          else if (_filteredApps.isEmpty)
+          else if (filteredApps.isEmpty)
             const Padding(
-              padding: EdgeInsets.all(18),
+              padding: EdgeInsets.all(22),
               child: Center(
                 child: Text(
                   'No apps match your search.',
-                  style: TextStyle(color: Colors.white54),
+                  style: TextStyle(color: muted, fontSize: 12),
                 ),
               ),
             )
           else
-            ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 360),
-              child: ListView.separated(
-                shrinkWrap: true,
-                itemCount: _filteredApps.length,
-                separatorBuilder: (_, __) =>
-                    const Divider(color: Colors.white10, height: 1),
+            SizedBox(
+              height: 320,
+              child: ListView.builder(
+                primary: false,
+                physics: const ClampingScrollPhysics(),
+                padding: EdgeInsets.zero,
+                itemCount: filteredApps.length,
                 itemBuilder: (context, index) {
-                  final app = _filteredApps[index];
-                  final name = app['name']!;
-                  final packageName = app['packageName']!;
-                  final selected = _selectedApps.contains(packageName);
+                  final app = filteredApps[index];
 
-                  return CheckboxListTile(
-                    value: selected,
-                    onChanged: (value) {
-                      _toggleApp(packageName, value ?? false);
-                    },
-                    activeColor: purple,
-                    checkColor: background,
-                    contentPadding: EdgeInsets.zero,
-                    controlAffinity: ListTileControlAffinity.trailing,
-                    title: Text(
-                      name,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                    subtitle: Text(
-                      packageName,
-                      style: const TextStyle(
-                        color: Colors.white38,
-                        fontSize: 10,
-                      ),
-                    ),
-                    secondary: Container(
-                      width: 38,
-                      height: 38,
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(
-                        color: purple.withValues(alpha: 0.12),
-                        borderRadius: BorderRadius.circular(11),
-                      ),
-                      child: const Icon(Icons.android, color: purple, size: 23),
-                    ),
+                  return _buildAppTile(
+                    app: app,
+                    selected: _selectedApps.contains(app['packageName']),
+                    showDivider: index < filteredApps.length - 1,
                   );
                 },
               ),
             ),
-          if (!_loadingApps && _apps.isNotEmpty) ...[
-            const SizedBox(height: 8),
-            Text(
-              'Showing ${_filteredApps.length} of ${_apps.length} apps',
-              style: const TextStyle(color: Colors.white38, fontSize: 11),
+
+          if (_settingsLoaded &&
+              !_loadingApps &&
+              _appError == null &&
+              _apps.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                const Icon(Icons.apps_rounded, color: muted, size: 15),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    'Showing ${filteredApps.length} of ${_apps.length} apps',
+                    style: const TextStyle(color: muted, fontSize: 10),
+                  ),
+                ),
+              ],
             ),
           ],
         ],
@@ -668,29 +1039,165 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
     );
   }
 
+  Widget _buildAppLoadingState() {
+    return Container(
+      height: 150,
+      alignment: Alignment.center,
+      child: const Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          SizedBox(
+            width: 25,
+            height: 25,
+            child: CircularProgressIndicator(strokeWidth: 2.5, color: mint),
+          ),
+          SizedBox(height: 12),
+          Text(
+            'Loading your apps...',
+            style: TextStyle(
+              color: cream,
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          SizedBox(height: 5),
+          Text(
+            'You can keep using the rest of the screen.',
+            style: TextStyle(color: muted, fontSize: 10),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAppTile({
+    required Map<String, dynamic> app,
+    required bool selected,
+    required bool showDivider,
+  }) {
+    final String name = app['name'] ?? 'Unknown app';
+    final String packageName = app['packageName'] ?? '';
+    final Uint8List? iconBytes = app['icon'];
+
+    return Column(
+      children: [
+        InkWell(
+          onTap: packageName.isEmpty
+              ? null
+              : () => _toggleApp(packageName, !selected),
+          borderRadius: BorderRadius.circular(14),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 10),
+            child: Row(
+              children: [
+                Container(
+                  width: 41,
+                  height: 41,
+                  decoration: BoxDecoration(
+                    color: selected ? mint.withValues(alpha: 0.14) : background,
+                    borderRadius: BorderRadius.circular(13),
+                  ),
+                  child: iconBytes != null
+                      ? ClipRRect(
+                          borderRadius: BorderRadius.circular(13),
+                          child: Image.memory(
+                            iconBytes,
+                            width: 41,
+                            height: 41,
+                            fit: BoxFit.cover,
+                            cacheWidth: 100,
+                            cacheHeight: 100,
+                            gaplessPlayback: true,
+                          ),
+                        )
+                      : Icon(
+                          Icons.android_rounded,
+                          color: selected ? mint : muted,
+                          size: 22,
+                        ),
+                ),
+                const SizedBox(width: 11),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: cream,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        packageName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: muted, fontSize: 9),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                AnimatedContainer(
+                  duration: const Duration(milliseconds: 150),
+                  width: 27,
+                  height: 27,
+                  decoration: BoxDecoration(
+                    color: selected ? mint : Colors.transparent,
+                    borderRadius: BorderRadius.circular(9),
+                    border: Border.all(
+                      color: selected ? mint : muted.withValues(alpha: 0.45),
+                    ),
+                  ),
+                  child: selected
+                      ? const Icon(
+                          Icons.check_rounded,
+                          color: background,
+                          size: 19,
+                        )
+                      : null,
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (showDivider)
+          Divider(height: 1, color: Colors.white.withValues(alpha: 0.06)),
+      ],
+    );
+  }
+
   Widget _buildAppError() {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 16),
+      padding: const EdgeInsets.symmetric(vertical: 17),
       child: Column(
         children: [
-          const Icon(Icons.error_outline, color: Colors.orangeAccent, size: 32),
-          const SizedBox(height: 8),
+          const Icon(Icons.error_outline_rounded, color: coral, size: 34),
+          const SizedBox(height: 10),
           const Text(
             'Could not load installed apps',
-            style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+            textAlign: TextAlign.center,
+            style: TextStyle(color: cream, fontWeight: FontWeight.w800),
           ),
           const SizedBox(height: 8),
           SelectableText(
             _appError ?? 'Unknown error',
             textAlign: TextAlign.center,
-            style: const TextStyle(color: Colors.white54, fontSize: 11),
+            style: const TextStyle(color: muted, fontSize: 10),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 13),
           OutlinedButton.icon(
             onPressed: _loadApps,
-            icon: const Icon(Icons.refresh),
+            icon: const Icon(Icons.refresh_rounded),
             label: const Text('Try again'),
-            style: OutlinedButton.styleFrom(foregroundColor: purple),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: mint,
+              side: const BorderSide(color: mint),
+            ),
           ),
         ],
       ),
@@ -699,28 +1206,56 @@ class _DistractionBlockerScreenState extends State<DistractionBlockerScreen> {
 
   Widget _buildNoApps() {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 20),
+      padding: const EdgeInsets.symmetric(vertical: 22),
       child: Column(
         children: [
-          const Icon(Icons.phone_android, color: Colors.white38, size: 34),
+          const Icon(Icons.phone_android_rounded, color: muted, size: 35),
           const SizedBox(height: 10),
           const Text(
-            'No launchable apps found',
-            style: TextStyle(color: Colors.white),
+            'No apps found',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: cream, fontWeight: FontWeight.w800),
           ),
           const SizedBox(height: 6),
           const Text(
-            'Check the Android integration and app visibility configuration, '
-            'then refresh.',
+            'Check the Android app visibility configuration and refresh.',
             textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.white54, fontSize: 12, height: 1.4),
+            style: TextStyle(color: muted, height: 1.5, fontSize: 11),
           ),
           const SizedBox(height: 12),
           OutlinedButton.icon(
             onPressed: _loadApps,
-            icon: const Icon(Icons.refresh),
+            icon: const Icon(Icons.refresh_rounded),
             label: const Text('Refresh installed apps'),
-            style: OutlinedButton.styleFrom(foregroundColor: purple),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: mint,
+              side: const BorderSide(color: mint),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFooterNote() {
+    return Container(
+      padding: const EdgeInsets.all(15),
+      decoration: BoxDecoration(
+        color: surface,
+        borderRadius: BorderRadius.circular(17),
+      ),
+      child: const Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.info_outline_rounded, color: yellow, size: 19),
+          SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Your selections are saved on this device. Actual app and '
+              'website enforcement depends on the Android blocking service '
+              'and its configuration.',
+              style: TextStyle(color: muted, fontSize: 11, height: 1.5),
+            ),
           ),
         ],
       ),

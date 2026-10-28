@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:math' as math;
 
+import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:timezone/data/latest_all.dart' as tz;
 import 'package:timezone/timezone.dart' as tz;
+
+import '../services/focus_session_store.dart';
 
 // MAXXING theme
 const Color _background = Color(0xFF17132B);
@@ -174,17 +177,45 @@ class _CustomDurationDialogState extends State<_CustomDurationDialog> {
 }
 
 class FocusScreen extends StatefulWidget {
-  const FocusScreen({super.key});
+  const FocusScreen({
+    super.key,
+    this.onStartSound,
+    this.onCompleteSound,
+  });
+
+  final Future<void> Function()? onStartSound;
+  final Future<void> Function()? onCompleteSound;
 
   @override
   State<FocusScreen> createState() => _FocusScreenState();
 }
 
-class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
+class _FocusScreenState extends State<FocusScreen>
+    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   static const int _distractionNotificationId = 707;
+  static const Color _portalViolet = Color(0xFF9D72FF);
+  static const Color _portalLavender = Color(0xFFD4C2FF);
 
   final FlutterLocalNotificationsPlugin _notifications =
       FlutterLocalNotificationsPlugin();
+  final FocusSessionStore _sessionStore = FocusSessionStore();
+  Future<AudioPool?>? _portalAudioPool;
+  Future<AudioPool?>? _completionAudioPool;
+  Future<void> _portalSoundQueue = Future<void>.value();
+  StopFunction? _activePortalSoundStop;
+  bool _isDisposed = false;
+  int _portalSoundRequestId = 0;
+  late final AnimationController _dimensionController;
+  late final Animation<double> _buttonScale;
+  late final Animation<double> _portalProgress;
+  late final Animation<double> _portalOpacity;
+  late final Animation<double> _roomGlowOpacity;
+  late final Animation<double> _enteringTitleOpacity;
+  late final Animation<double> _activatedTitleOpacity;
+  late final Animation<double> _contentScale;
+  late final Animation<double> _biscuitScale;
+  late final Animation<double> _timerOpacity;
+  late final Animation<Offset> _timerSlide;
 
   Timer? _timer;
   DateTime? _endTime;
@@ -193,9 +224,16 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
   int _selectedMinutes = 25;
   int _remainingSeconds = 25 * 60;
   int _completedSessions = 0;
+  String? _sessionId;
 
   bool _isRunning = false;
+  bool _isSessionPaused = false;
+  bool _isTransitioning = false;
   bool _sessionCompleted = false;
+  bool _isCompletingSession = false;
+  bool _isRestoringSession = true;
+  bool _isPersistingSession = false;
+  bool _isRestoringSessionInFlight = false;
   bool _guardEnabled = true;
   bool _notificationsReady = false;
   bool _notificationPermissionGranted = false;
@@ -203,11 +241,7 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
 
   int get _totalSeconds => _selectedMinutes * 60;
 
-  bool get _isPaused =>
-      !_isRunning &&
-      !_sessionCompleted &&
-      _remainingSeconds > 0 &&
-      _remainingSeconds < _totalSeconds;
+  bool get _isPaused => _isSessionPaused;
 
   double get _progress {
     if (_totalSeconds <= 0) return 0;
@@ -237,7 +271,243 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _dimensionController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1500),
+    );
+    _buttonScale = TweenSequence<double>([
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1,
+          end: 0.95,
+        ).chain(CurveTween(curve: Curves.easeOutCubic)),
+        weight: 5,
+      ),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0.95,
+          end: 1.035,
+        ).chain(CurveTween(curve: Curves.easeOutCubic)),
+        weight: 7,
+      ),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1.035,
+          end: 1,
+        ).chain(CurveTween(curve: Curves.easeInOutCubic)),
+        weight: 8,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(1), weight: 80),
+    ]).animate(_dimensionController);
+    _portalProgress = CurvedAnimation(
+      parent: _dimensionController,
+      curve: const Interval(0.2, 0.72, curve: Curves.easeOutCubic),
+    );
+    _portalOpacity = Tween<double>(begin: 1, end: 0).animate(
+      CurvedAnimation(
+        parent: _dimensionController,
+        curve: const Interval(0.62, 1, curve: Curves.easeInCubic),
+      ),
+    );
+    _roomGlowOpacity = TweenSequence<double>([
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0,
+          end: 1,
+        ).chain(CurveTween(curve: Curves.easeOutCubic)),
+        weight: 12,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(1), weight: 53),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1,
+          end: 0,
+        ).chain(CurveTween(curve: Curves.easeInCubic)),
+        weight: 35,
+      ),
+    ]).animate(_dimensionController);
+    _enteringTitleOpacity = TweenSequence<double>([
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0,
+          end: 1,
+        ).chain(CurveTween(curve: Curves.easeOutCubic)),
+        weight: 5,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(1), weight: 10),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1,
+          end: 0,
+        ).chain(CurveTween(curve: Curves.easeInCubic)),
+        weight: 8,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(0), weight: 77),
+    ]).animate(_dimensionController);
+    _activatedTitleOpacity = TweenSequence<double>([
+      TweenSequenceItem(tween: ConstantTween<double>(0), weight: 65),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0,
+          end: 1,
+        ).chain(CurveTween(curve: Curves.easeOutCubic)),
+        weight: 8,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(1), weight: 17),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1,
+          end: 0,
+        ).chain(CurveTween(curve: Curves.easeInCubic)),
+        weight: 10,
+      ),
+    ]).animate(_dimensionController);
+    _contentScale = TweenSequence<double>([
+      TweenSequenceItem(tween: ConstantTween<double>(1), weight: 20),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1,
+          end: 1.012,
+        ).chain(CurveTween(curve: Curves.easeOutCubic)),
+        weight: 15,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(1.012), weight: 27),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1.012,
+          end: 1,
+        ).chain(CurveTween(curve: Curves.easeInOutCubic)),
+        weight: 25,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(1), weight: 13),
+    ]).animate(_dimensionController);
+    _biscuitScale = TweenSequence<double>([
+      TweenSequenceItem(tween: ConstantTween<double>(1), weight: 32),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1,
+          end: 1.035,
+        ).chain(CurveTween(curve: Curves.easeOutCubic)),
+        weight: 14,
+      ),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1.035,
+          end: 1,
+        ).chain(CurveTween(curve: Curves.easeInOutCubic)),
+        weight: 20,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(1), weight: 34),
+    ]).animate(_dimensionController);
+    _timerOpacity = TweenSequence<double>([
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1,
+          end: 0.18,
+        ).chain(CurveTween(curve: Curves.easeInOutCubic)),
+        weight: 25,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(0.18), weight: 30),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0.18,
+          end: 1,
+        ).chain(CurveTween(curve: Curves.easeOutCubic)),
+        weight: 45,
+      ),
+    ]).animate(_dimensionController);
+    _timerSlide = Tween<Offset>(begin: const Offset(0, 0.06), end: Offset.zero)
+        .animate(
+          CurvedAnimation(
+            parent: _dimensionController,
+            curve: const Interval(0.55, 1, curve: Curves.easeOutCubic),
+          ),
+        );
+    unawaited(_restoreFocusSession());
     _initializeNotifications();
+  }
+
+  Future<void> _restoreFocusSession() async {
+    if (_isRestoringSessionInFlight || _isDisposed) return;
+    _isRestoringSessionInFlight = true;
+    try {
+      final session = await _sessionStore.load();
+      if (!mounted || _isDisposed) return;
+
+      final endTimestampMs = session.endTimestampMs;
+      var remainingSeconds = session.remainingSeconds;
+      var isRunning = session.isRunning;
+
+      if (isRunning) {
+        if (endTimestampMs == null || session.sessionId == null) {
+          await _sessionStore.reset(session.selectedMinutes);
+          isRunning = false;
+          remainingSeconds = session.selectedMinutes * 60;
+        } else {
+          final millisecondsLeft =
+              endTimestampMs - DateTime.now().millisecondsSinceEpoch;
+          remainingSeconds = millisecondsLeft <= 0
+              ? 0
+              : (millisecondsLeft / 1000).ceil();
+        }
+      }
+
+      setState(() {
+        _selectedMinutes = session.selectedMinutes;
+        _remainingSeconds = remainingSeconds;
+        _sessionId = session.sessionId;
+        _sessionCompleted = session.completed || session.state == 'completed';
+        _isRunning = isRunning && remainingSeconds > 0;
+        _isSessionPaused = session.isPaused;
+        _isRestoringSession = false;
+      });
+
+      if (isRunning && remainingSeconds <= 0 && session.sessionId != null) {
+        _finishSession(sessionId: session.sessionId);
+      } else if (_isRunning) {
+        _endTime = DateTime.fromMillisecondsSinceEpoch(endTimestampMs!);
+        _startTicking();
+      } else if (_sessionCompleted && session.rewardPending) {
+        await _completeFocusReward(session.sessionId);
+      }
+    } catch (error) {
+      debugPrint('Could not restore saved focus session: $error');
+      if (mounted) {
+        setState(() {
+          _isRestoringSession = false;
+        });
+      }
+    } finally {
+      _isRestoringSessionInFlight = false;
+    }
+  }
+
+  Future<AudioPool?> _preparePortalSound() async {
+    try {
+      return await AudioPool.createFromAsset(
+        path: 'audio/portal_activation.wav',
+        minPlayers: 1,
+        maxPlayers: 1,
+        playerMode: PlayerMode.mediaPlayer,
+      );
+    } catch (error) {
+      debugPrint('Could not prepare focus portal sound asset: $error');
+      return null;
+    }
+  }
+
+  Future<AudioPool?> _prepareCompletionSound() async {
+    try {
+      return await AudioPool.createFromAsset(
+        path: 'audio/quest_complete.wav',
+        minPlayers: 1,
+        maxPlayers: 1,
+        playerMode: PlayerMode.mediaPlayer,
+      );
+    } catch (error) {
+      debugPrint('Could not prepare focus completion sound asset: $error');
+      return null;
+    }
   }
 
   Future<void> _initializeNotifications() async {
@@ -285,13 +555,22 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      // Resync the clock whenever the app returns to the foreground.
-      _tick();
+      unawaited(_restoreFocusSession());
 
       if (_guardEnabled) {
         _handleAppReturn();
       }
     } else if (state == AppLifecycleState.paused) {
+      if (_isTransitioning) {
+        _dimensionController.stop();
+        _stopPortalSound();
+        if (mounted) {
+          setState(() {
+            _isTransitioning = false;
+          });
+        }
+      }
+
       if (_guardEnabled &&
           _isRunning &&
           _notificationsReady &&
@@ -392,33 +671,231 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
     }
   }
 
-  void _startTimer() {
-    if (_isRunning) return;
-
-    if (_remainingSeconds <= 0) {
-      _remainingSeconds = _totalSeconds;
+  Future<void> _startTimer({required bool newSession}) async {
+    if (_isRunning ||
+        _isCompletingSession ||
+        _isPersistingSession ||
+        _isRestoringSession) {
+      return;
     }
 
-    _endTime = DateTime.now().add(Duration(seconds: _remainingSeconds));
-
+    final remainingSeconds = _remainingSeconds <= 0
+        ? _totalSeconds
+        : _remainingSeconds;
+    final sessionId = newSession
+        ? _createSessionId()
+        : _sessionId ?? _createSessionId();
+    final endTime = DateTime.now().add(Duration(seconds: remainingSeconds));
     setState(() {
-      _isRunning = true;
-      _sessionCompleted = false;
+      _isPersistingSession = true;
     });
 
+    try {
+      await _sessionStore.save(
+        FocusSessionSnapshot(
+          state: 'running',
+          selectedMinutes: _selectedMinutes,
+          remainingSeconds: remainingSeconds,
+          endTimestampMs: endTime.millisecondsSinceEpoch,
+          sessionId: sessionId,
+          completed: false,
+          rewarded: false,
+          rewardPending: false,
+          rewardBaseTreats: null,
+        ),
+      );
+    } catch (error) {
+      debugPrint('Could not save focus session start: $error');
+      if (mounted) {
+        setState(() {
+          _isPersistingSession = false;
+          _isTransitioning = false;
+        });
+      }
+      return;
+    }
+
+    if (!mounted) return;
+    _timer?.cancel();
+    _endTime = endTime;
+    _sessionId = sessionId;
+    setState(() {
+      _isRunning = true;
+      _isSessionPaused = false;
+      _sessionCompleted = false;
+      _isTransitioning = false;
+      _isPersistingSession = false;
+      _remainingSeconds = remainingSeconds;
+    });
+
+    _startTicking();
+  }
+
+  String _createSessionId() {
+    final randomPart = math.Random.secure().nextInt(0x7fffffff);
+    return '${DateTime.now().microsecondsSinceEpoch}-$randomPart';
+  }
+
+  void _startTicking() {
     _timer?.cancel();
     _timer = Timer.periodic(const Duration(milliseconds: 250), (_) => _tick());
   }
 
-  void _pauseTimer() {
-    if (!_isRunning) return;
+  void _startOrResumeQuest() {
+    if (_isRunning ||
+        _isTransitioning ||
+        _isCompletingSession ||
+        _isRestoringSession ||
+        _isPersistingSession) {
+      return;
+    }
 
-    final end = _endTime;
+    if (_isPaused) {
+      unawaited(_startTimer(newSession: false));
+      return;
+    }
 
     _timer?.cancel();
     _timer = null;
     _endTime = null;
+    _dimensionController
+      ..stop()
+      ..value = 0;
 
+    setState(() {
+      if (_sessionCompleted || _remainingSeconds <= 0) {
+        _remainingSeconds = _totalSeconds;
+      }
+      _isTransitioning = true;
+      _sessionCompleted = false;
+    });
+    _playPortalSound();
+    unawaited(_playDimensionTransition());
+  }
+
+  Future<void> _playDimensionTransition() async {
+    try {
+      await _dimensionController.forward(from: 0).orCancel;
+    } on TickerCanceled {
+      return;
+    }
+
+    if (!mounted || !_isTransitioning) return;
+
+    setState(() {
+      _isTransitioning = false;
+    });
+    await _startTimer(newSession: true);
+  }
+
+  void _playPortalSound() {
+    if (_isDisposed) return;
+    final requestId = ++_portalSoundRequestId;
+    _portalSoundQueue = _portalSoundQueue.then(
+      (_) => _startPortalSound(requestId),
+    );
+    unawaited(_portalSoundQueue);
+  }
+
+  void _playCompletionSound() {
+    if (_isDisposed) return;
+    final requestId = ++_portalSoundRequestId;
+    _portalSoundQueue = _portalSoundQueue.then(
+      (_) => _startCompletionSound(requestId),
+    );
+    unawaited(_portalSoundQueue);
+  }
+
+  Future<void> _startPortalSound(int requestId) async {
+    if (_isDisposed || requestId != _portalSoundRequestId) return;
+    try {
+      final onStartSound = widget.onStartSound;
+      if (onStartSound != null) {
+        await onStartSound();
+        return;
+      }
+
+      final pool = _portalAudioPool ??= _preparePortalSound();
+      final resolvedPool = await pool;
+      if (resolvedPool == null) {
+        debugPrint(
+          'Focus portal sound is unavailable; audio pool did not initialize.',
+        );
+        return;
+      }
+      if (_isDisposed || requestId != _portalSoundRequestId) return;
+
+      final previousStop = _activePortalSoundStop;
+      _activePortalSoundStop = null;
+      await previousStop?.call();
+      if (_isDisposed || requestId != _portalSoundRequestId) return;
+
+      final stop = await resolvedPool.start(volume: 0.85);
+      if (_isDisposed || requestId != _portalSoundRequestId) {
+        await stop();
+      } else {
+        _activePortalSoundStop = stop;
+        debugPrint('Focus portal sound started.');
+      }
+    } catch (error) {
+      debugPrint('Could not play focus portal sound: $error');
+    }
+  }
+
+  Future<void> _startCompletionSound(int requestId) async {
+    if (_isDisposed || requestId != _portalSoundRequestId) return;
+    try {
+      final onCompleteSound = widget.onCompleteSound;
+      if (onCompleteSound != null) {
+        await onCompleteSound();
+        return;
+      }
+
+      final completionPool = _completionAudioPool ??= _prepareCompletionSound();
+      final pool = await completionPool;
+      if (pool == null) {
+        debugPrint(
+          'Focus completion sound is unavailable; audio pool did not initialize.',
+        );
+        return;
+      }
+      if (_isDisposed || requestId != _portalSoundRequestId) return;
+
+      final previousStop = _activePortalSoundStop;
+      _activePortalSoundStop = null;
+      await previousStop?.call();
+      if (_isDisposed || requestId != _portalSoundRequestId) return;
+
+      final stop = await pool.start(volume: 0.95);
+      if (_isDisposed || requestId != _portalSoundRequestId) {
+        await stop();
+      } else {
+        _activePortalSoundStop = stop;
+        debugPrint('Focus completion sound started.');
+      }
+    } catch (error) {
+      debugPrint('Could not play focus completion sound: $error');
+    }
+  }
+
+  void _stopPortalSound() {
+    _portalSoundRequestId++;
+    _portalSoundQueue = _portalSoundQueue.then((_) async {
+      final stop = _activePortalSoundStop;
+      _activePortalSoundStop = null;
+      try {
+        await stop?.call();
+      } catch (error) {
+        debugPrint('Could not stop focus portal sound: $error');
+      }
+    });
+    unawaited(_portalSoundQueue);
+  }
+
+  Future<void> _pauseTimer() async {
+    if (!_isRunning || _isPersistingSession) return;
+
+    final end = _endTime;
     final secondsLeft = end == null ? _remainingSeconds : _secondsUntil(end);
 
     if (secondsLeft <= 0) {
@@ -427,46 +904,133 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
     }
 
     setState(() {
-      _isRunning = false;
-      _remainingSeconds = secondsLeft;
+      _isPersistingSession = true;
     });
+
+    _timer?.cancel();
+    _timer = null;
+    _endTime = null;
+    try {
+      await _sessionStore.save(
+        FocusSessionSnapshot(
+          state: 'paused',
+          selectedMinutes: _selectedMinutes,
+          remainingSeconds: secondsLeft,
+          endTimestampMs: null,
+          sessionId: _sessionId,
+          completed: false,
+          rewarded: false,
+          rewardPending: false,
+          rewardBaseTreats: null,
+        ),
+      );
+      if (!mounted) return;
+      setState(() {
+        _isRunning = false;
+        _isSessionPaused = true;
+        _remainingSeconds = secondsLeft;
+        _isPersistingSession = false;
+      });
+    } catch (error) {
+      debugPrint('Could not persist paused focus session: $error');
+      if (!mounted) return;
+      final resumedEnd = DateTime.now().add(Duration(seconds: secondsLeft));
+      setState(() {
+        _isRunning = true;
+        _isSessionPaused = false;
+        _remainingSeconds = secondsLeft;
+        _endTime = resumedEnd;
+        _isPersistingSession = false;
+      });
+      _startTicking();
+    }
 
     _cancelDistractionReminder();
   }
 
-  void _resetTimer() {
+  Future<void> _resetTimer() async {
+    if (_isCompletingSession || _isPersistingSession) return;
+    final resetDuration = _selectedMinutes;
+
+    if (_isTransitioning) {
+      _stopPortalSound();
+    }
+    _dimensionController
+      ..stop()
+      ..value = 0;
     _timer?.cancel();
     _timer = null;
     _endTime = null;
 
     setState(() {
+      _isPersistingSession = true;
       _isRunning = false;
+      _isSessionPaused = false;
+      _isTransitioning = false;
       _sessionCompleted = false;
       _remainingSeconds = _totalSeconds;
+      _sessionId = null;
     });
 
+    try {
+      await _sessionStore.reset(resetDuration);
+    } catch (error) {
+      debugPrint('Could not reset persisted focus session: $error');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isPersistingSession = false;
+        });
+      }
+    }
     _cancelDistractionReminder();
   }
 
-  void _selectDuration(int minutes) {
-    if (_isRunning) return;
+  Future<void> _selectDuration(int minutes) async {
+    if (_isRunning ||
+        _isTransitioning ||
+        _isCompletingSession ||
+        _isPersistingSession ||
+        _isRestoringSession) {
+      return;
+    }
 
     _timer?.cancel();
     _timer = null;
     _endTime = null;
 
     setState(() {
+      _isPersistingSession = true;
       _selectedMinutes = minutes;
       _remainingSeconds = minutes * 60;
       _isRunning = false;
+      _isSessionPaused = false;
       _sessionCompleted = false;
+      _sessionId = null;
     });
 
+    try {
+      await _sessionStore.reset(minutes);
+    } catch (error) {
+      debugPrint('Could not persist selected focus duration: $error');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isPersistingSession = false;
+        });
+      }
+    }
     _cancelDistractionReminder();
   }
 
   Future<void> _showCustomDurationDialog() async {
-    if (_isRunning) return;
+    if (_isRunning ||
+        _isTransitioning ||
+        _isCompletingSession ||
+        _isPersistingSession ||
+        _isRestoringSession) {
+      return;
+    }
 
     final customMinutes = await showDialog<int>(
       context: context,
@@ -478,21 +1042,14 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _rewardBiscuitForFocus() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final currentTreats = prefs.getInt('biscuit_treats') ?? 5;
-
-      await prefs.setInt('biscuit_treats', currentTreats + 1);
-
-      debugPrint('Biscuit earned 1 treat for a completed focus session.');
-    } catch (error) {
-      debugPrint('Could not save Biscuit focus reward: $error');
+  void _finishSession({String? sessionId}) {
+    final completedSessionId = sessionId ?? _sessionId;
+    if (!mounted ||
+        _sessionCompleted ||
+        _isCompletingSession ||
+        completedSessionId == null) {
+      return;
     }
-  }
-
-  void _finishSession() {
-    if (!mounted || _sessionCompleted) return;
 
     _timer?.cancel();
     _timer = null;
@@ -501,13 +1058,42 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
     setState(() {
       _remainingSeconds = 0;
       _isRunning = false;
+      _isSessionPaused = false;
       _sessionCompleted = true;
+      _isCompletingSession = true;
       _completedSessions++;
     });
 
-    _rewardBiscuitForFocus();
+    _playCompletionSound();
+    unawaited(_completeSessionReward(completedSessionId));
     _cancelDistractionReminder();
-    _showCompletionDialog();
+  }
+
+  Future<void> _completeSessionReward(String sessionId) async {
+    var rewardSaved = false;
+    try {
+      rewardSaved = await _sessionStore.completeAndReward(sessionId);
+    } catch (error) {
+      debugPrint('Could not complete focus reward for $sessionId: $error');
+    }
+    if (!mounted) return;
+
+    setState(() {
+      _isCompletingSession = false;
+    });
+    if (rewardSaved) {
+      _showCompletionDialog(rewardSaved: true);
+    } else {
+      _showCompletionDialog(rewardSaved: false);
+    }
+  }
+
+  Future<void> _completeFocusReward(String? sessionId) async {
+    if (sessionId == null || !mounted) return;
+    setState(() {
+      _isCompletingSession = true;
+    });
+    await _completeSessionReward(sessionId);
   }
 
   Future<void> _cancelDistractionReminder() async {
@@ -532,7 +1118,7 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
     });
   }
 
-  void _showCompletionDialog() {
+  void _showCompletionDialog({required bool rewardSaved}) {
     if (!mounted || !context.mounted) return;
 
     showDialog<void>(
@@ -554,11 +1140,15 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
             textAlign: TextAlign.center,
             style: TextStyle(color: _cream, fontWeight: FontWeight.w900),
           ),
-          content: const Text(
-            'You showed up and stayed focused. Biscuit earned 1 treat '
-            'because of you. Take a breath, then choose your next quest.',
+          content: Text(
+            rewardSaved
+                ? 'You showed up and stayed focused. Biscuit earned 1 treat '
+                      'because of you. Take a breath, then choose your next quest.'
+                : 'You completed your focus quest, but the treat could not '
+                      'be saved. Please check your device storage before '
+                      'starting another quest.',
             textAlign: TextAlign.center,
-            style: TextStyle(color: _softText, height: 1.5),
+            style: const TextStyle(color: _softText, height: 1.5),
           ),
           actionsAlignment: MainAxisAlignment.center,
           actions: [
@@ -586,6 +1176,19 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _timer?.cancel();
+    _isDisposed = true;
+    _portalSoundRequestId++;
+    _stopPortalSound();
+    final portalAudioPool = _portalAudioPool;
+    if (portalAudioPool != null) {
+      unawaited(
+        _portalSoundQueue.then((_) async {
+          final pool = await portalAudioPool;
+          await pool?.dispose();
+        }),
+      );
+    }
+    _dimensionController.dispose();
 
     // Keep scheduled reminders intact when this screen is disposed.
     super.dispose();
@@ -672,42 +1275,178 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
           ),
         ],
       ),
-      body: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(18, 8, 18, 28),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+      body: Stack(
+        children: [
+          AnimatedBuilder(
+            animation: _dimensionController,
+            builder: (context, child) {
+              return Transform.scale(
+                scale: _isTransitioning ? _contentScale.value : 1,
+                child: child,
+              );
+            },
+            child: SafeArea(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(18, 8, 18, 28),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildQuestHeader(),
+                    const SizedBox(height: 18),
+                    _buildBiscuitTransitionCard(),
+                    const SizedBox(height: 18),
+                    _buildTimerEntry(),
+                    const SizedBox(height: 16),
+                    _buildDurationCard(),
+                    const SizedBox(height: 16),
+                    _buildRewardCard(),
+                    const SizedBox(height: 16),
+                    _buildDistractionGuardCard(),
+                    const SizedBox(height: 20),
+                    Center(
+                      child: Text(
+                        _sessionCompleted
+                            ? 'NICE WORK, FOCUS CHAMPION.'
+                            : 'SMALL STEPS. BIG XP. EVERY DAY.',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: _softText,
+                          fontSize: 10,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 1.5,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          if (_isTransitioning) _buildDimensionOverlay(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDimensionOverlay() {
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: RepaintBoundary(
+          child: AnimatedBuilder(
+            animation: _dimensionController,
+            builder: (context, _) {
+              final portalOpacity = _portalOpacity.value;
+              final portalProgress = _portalProgress.value;
+              return Stack(
+                fit: StackFit.expand,
+                children: [
+                  ColoredBox(
+                    color: _portalViolet.withValues(
+                      alpha: 0.18 * _roomGlowOpacity.value,
+                    ),
+                  ),
+                  ColoredBox(
+                    color: const Color(
+                      0xFF090613,
+                    ).withValues(alpha: 0.2 * _roomGlowOpacity.value),
+                  ),
+                  CustomPaint(
+                    painter: _FocusPortalPainter(
+                      progress: portalProgress,
+                      opacity: portalOpacity,
+                    ),
+                  ),
+                  Center(
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        FadeTransition(
+                          opacity: _enteringTitleOpacity,
+                          child: _dimensionMessage('ENTERING FOCUS DIMENSION'),
+                        ),
+                        FadeTransition(
+                          opacity: _activatedTitleOpacity,
+                          child: _dimensionMessage('FOCUS MODE ACTIVATED'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _dimensionMessage(String message) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+      decoration: BoxDecoration(
+        color: _background.withValues(alpha: 0.88),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _portalLavender.withValues(alpha: 0.7)),
+      ),
+      child: Text(
+        message,
+        textAlign: TextAlign.center,
+        style: const TextStyle(
+          color: _cream,
+          fontSize: 12,
+          fontWeight: FontWeight.w900,
+          letterSpacing: 1.4,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBiscuitTransitionCard() {
+    return AnimatedBuilder(
+      animation: _dimensionController,
+      child: _buildBiscuitCard(),
+      builder: (context, child) {
+        final shieldOpacity = _isTransitioning
+            ? _portalProgress.value * _portalOpacity.value
+            : 0.0;
+        return Transform.scale(
+          scale: _isTransitioning ? _biscuitScale.value : 1,
+          child: Stack(
             children: [
-              _buildQuestHeader(),
-              const SizedBox(height: 18),
-              _buildBiscuitCard(),
-              const SizedBox(height: 18),
-              _buildTimerCard(),
-              const SizedBox(height: 16),
-              _buildDurationCard(),
-              const SizedBox(height: 16),
-              _buildRewardCard(),
-              const SizedBox(height: 16),
-              _buildDistractionGuardCard(),
-              const SizedBox(height: 20),
-              Center(
-                child: Text(
-                  _sessionCompleted
-                      ? 'NICE WORK, FOCUS CHAMPION.'
-                      : 'SMALL STEPS. BIG XP. EVERY DAY.',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    color: _softText,
-                    fontSize: 10,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 1.5,
+              child!,
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(24),
+                      border: Border.all(
+                        color: _portalLavender.withValues(
+                          alpha: 0.85 * shieldOpacity,
+                        ),
+                        width: 1.5 + 1.5 * shieldOpacity,
+                      ),
+                    ),
                   ),
                 ),
               ),
             ],
           ),
-        ),
-      ),
+        );
+      },
+    );
+  }
+
+  Widget _buildTimerEntry() {
+    return AnimatedBuilder(
+      animation: _dimensionController,
+      child: _buildTimerCard(),
+      builder: (context, child) {
+        if (!_isTransitioning) return child!;
+        return FadeTransition(
+          opacity: _timerOpacity,
+          child: SlideTransition(position: _timerSlide, child: child),
+        );
+      },
     );
   }
 
@@ -971,34 +1710,53 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
           Row(
             children: [
               Expanded(
-                child: ElevatedButton.icon(
-                  onPressed: _isRunning ? _pauseTimer : _startTimer,
-                  icon: Icon(
-                    _isRunning
-                        ? Icons.pause_rounded
-                        : _isPaused
-                        ? Icons.play_arrow_rounded
-                        : Icons.bolt_rounded,
-                  ),
-                  label: Text(
-                    _isRunning
-                        ? 'PAUSE QUEST'
-                        : _isPaused
-                        ? 'RESUME QUEST'
-                        : 'START QUEST',
-                  ),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: _purple,
-                    foregroundColor: _background,
-                    elevation: 0,
-                    padding: const EdgeInsets.symmetric(vertical: 17),
-                    textStyle: const TextStyle(
-                      fontWeight: FontWeight.w900,
-                      fontSize: 12,
-                      letterSpacing: 0.6,
+                child: ScaleTransition(
+                  scale: _buttonScale,
+                  child: ElevatedButton.icon(
+                    onPressed:
+                        _isCompletingSession ||
+                            _isTransitioning ||
+                            _isPersistingSession ||
+                            _isRestoringSession
+                        ? null
+                        : _isRunning
+                        ? _pauseTimer
+                        : _startOrResumeQuest,
+                    icon: Icon(
+                      _isCompletingSession
+                          ? Icons.hourglass_top_rounded
+                          : _isRunning
+                          ? Icons.pause_rounded
+                          : _isPaused
+                          ? Icons.play_arrow_rounded
+                          : Icons.bolt_rounded,
                     ),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(15),
+                    label: Text(
+                      _isCompletingSession
+                          ? 'SAVING REWARD'
+                          : _isRestoringSession || _isPersistingSession
+                          ? 'SAVING QUEST'
+                          : _isTransitioning
+                          ? 'ENTERING DIMENSION'
+                          : _isRunning
+                          ? 'PAUSE QUEST'
+                          : _isPaused
+                          ? 'RESUME QUEST'
+                          : 'START QUEST',
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _purple,
+                      foregroundColor: _background,
+                      elevation: 0,
+                      padding: const EdgeInsets.symmetric(vertical: 17),
+                      textStyle: const TextStyle(
+                        fontWeight: FontWeight.w900,
+                        fontSize: 12,
+                        letterSpacing: 0.6,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(15),
+                      ),
                     ),
                   ),
                 ),
@@ -1013,7 +1771,12 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
                   ),
                 ),
                 child: IconButton(
-                  onPressed: _resetTimer,
+                  onPressed:
+                      _isCompletingSession ||
+                          _isPersistingSession ||
+                          _isRestoringSession
+                      ? null
+                      : _resetTimer,
                   tooltip: 'Reset timer',
                   icon: const Icon(Icons.restart_alt_rounded, color: _cream),
                   padding: const EdgeInsets.all(14),
@@ -1231,7 +1994,14 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
 
     return Expanded(
       child: OutlinedButton(
-        onPressed: _isRunning ? null : _showCustomDurationDialog,
+        onPressed:
+            _isRunning ||
+                _isTransitioning ||
+                _isCompletingSession ||
+                _isPersistingSession ||
+                _isRestoringSession
+            ? null
+            : _showCustomDurationDialog,
         style: OutlinedButton.styleFrom(
           backgroundColor: isCustom
               ? _purple.withValues(alpha: 0.13)
@@ -1256,7 +2026,14 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
 
     return Expanded(
       child: OutlinedButton(
-        onPressed: _isRunning ? null : () => _selectDuration(minutes),
+        onPressed:
+            _isRunning ||
+                _isTransitioning ||
+                _isCompletingSession ||
+                _isPersistingSession ||
+                _isRestoringSession
+            ? null
+            : () => _selectDuration(minutes),
         style: OutlinedButton.styleFrom(
           backgroundColor: selected ? _purple : _background,
           foregroundColor: selected ? _background : _softText,
@@ -1282,5 +2059,121 @@ class _FocusScreenState extends State<FocusScreen> with WidgetsBindingObserver {
         ),
       ),
     );
+  }
+}
+
+class _FocusPortalPainter extends CustomPainter {
+  const _FocusPortalPainter({required this.progress, required this.opacity});
+
+  final double progress;
+  final double opacity;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (progress <= 0 || opacity <= 0) return;
+
+    final center = Offset(size.width / 2, size.height / 2);
+    final maxRadius =
+        math.sqrt(size.width * size.width + size.height * size.height) * 0.7;
+    final portalRadius = math.max(12.0, maxRadius * progress);
+    final portalBounds = Rect.fromCircle(center: center, radius: portalRadius);
+
+    final portalPaint = Paint()
+      ..shader = const RadialGradient(
+        colors: [
+          Color(0xEE171027),
+          Color(0xDD24133F),
+          Color(0xC04D238D),
+          Color(0xAA8B5CFF),
+          Color(0x00DCCBFF),
+        ],
+        stops: [0, 0.48, 0.76, 0.9, 1],
+      ).createShader(portalBounds)
+      ..color = Colors.white.withValues(alpha: opacity);
+    canvas.drawCircle(center, portalRadius, portalPaint);
+
+    const ringColors = [
+      Color(0xFFF0E8FF),
+      Color(0xFFC09AFF),
+      Color(0xFF8A4DFF),
+      Color(0xFFFFD66B),
+    ];
+    for (var ring = 0; ring < ringColors.length; ring++) {
+      final ringProgress = (progress - ring * 0.1).clamp(0.0, 1.0);
+      if (ringProgress <= 0) continue;
+
+      final radiusFactor = 1 - ring * 0.075;
+
+      final paint = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = ring == 0
+            ? 5
+            : ring == 1
+            ? 3.5
+            : 2.5
+        ..color = ringColors[ring].withValues(
+          alpha: opacity * (ring == 0 ? 0.95 : 0.75),
+        );
+      canvas.drawCircle(center, maxRadius * ringProgress * radiusFactor, paint);
+
+      if (ring < 3) {
+        final arcPaint = Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeCap = StrokeCap.square
+          ..strokeWidth = 5
+          ..color = ringColors[ring].withValues(alpha: opacity * 0.9);
+        canvas.drawArc(
+          Rect.fromCircle(
+            center: center,
+            radius: maxRadius * ringProgress * (0.72 + ring * 0.07),
+          ),
+          ring * 0.9,
+          math.pi * 0.65,
+          false,
+          arcPaint,
+        );
+      }
+    }
+
+    const particleColors = [
+      Color(0xFFF0E8FF),
+      Color(0xFFC09AFF),
+      Color(0xFF8A4DFF),
+      Color(0xFFFFD66B),
+    ];
+    for (var particle = 0; particle < 32; particle++) {
+      final startOffset = (particle % 8) * 0.025;
+      final particleProgress = ((progress - startOffset) / (1 - startOffset))
+          .clamp(0.0, 1.0);
+      if (particleProgress <= 0) continue;
+
+      final angle = particle * math.pi * 2 / 32;
+      final distance =
+          maxRadius *
+          (0.22 + particleProgress * 0.78) *
+          (0.58 + (particle % 5) * 0.09);
+      final point = Offset(
+        center.dx + math.cos(angle) * distance,
+        center.dy + math.sin(angle) * distance,
+      );
+      final particleSize = 3.5 + (particle % 4) * 1.2;
+      final paint = Paint()
+        ..color = particleColors[particle % particleColors.length].withValues(
+          alpha: opacity * (0.98 - particleProgress * 0.2),
+        );
+      canvas.drawRect(
+        Rect.fromCenter(
+          center: point,
+          width: particleSize,
+          height: particleSize,
+        ),
+        paint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _FocusPortalPainter oldDelegate) {
+    return progress != oldDelegate.progress || opacity != oldDelegate.opacity;
   }
 }

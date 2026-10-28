@@ -3,10 +3,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../services/focus_session_store.dart';
 import 'task_screens.dart';
 import 'progress_screen.dart';
 import 'focus_screen.dart';
-import 'ai_review_screen.dart';
+import 'study_buddy.dart';
 import 'distraction_blocker_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -16,7 +17,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   static const Color _background = Color(0xFF17132B);
   static const Color _panel = Color(0xFF241D42);
   static const Color _cream = Color(0xFFF6EFE3);
@@ -27,37 +28,177 @@ class _HomeScreenState extends State<HomeScreen> {
 
   static const String _happinessKey = 'biscuit_happiness';
   static const String _treatsKey = 'biscuit_treats';
+  static const String _energyKey = 'biscuit_energy';
+  static const String _energyDecayAnchorKey = 'biscuit_energy_decay_anchor_ms';
+  static const String _happinessDecayAnchorKey =
+      'biscuit_happiness_decay_anchor_ms';
+  static const int _energyDecayIntervalMs = 10 * 60 * 1000;
+  static const int _happinessDecayIntervalMs = 20 * 60 * 1000;
 
+  final FocusSessionStore _focusSessionStore = FocusSessionStore();
   bool _biscuitIsBlinking = false;
   bool _isLoadingStats = true;
+  bool _isUpdatingStats = false;
 
   int _biscuitHappiness = 90;
+  int _biscuitEnergy = 100;
   int _biscuitTreats = 5;
 
   String _biscuitMessage = 'Ready to make today count?';
 
   Timer? _biscuitBlinkTimer;
   Timer? _biscuitBlinkOffTimer;
+  Timer? _statsRefreshTimer;
+  Future<void>? _statsRefreshInFlight;
+  Future<void>? _focusRecoveryInFlight;
+
+  // Time-based scene state
+  String _denSceneAsset = 'assets/images/den_scene.png';
+  Timer? _denSceneTimer;
 
   @override
   void initState() {
     super.initState();
-    _loadBiscuitStats();
+    WidgetsBinding.instance.addObserver(this);
+
+    _denSceneAsset = _getDenSceneForTime(DateTime.now());
+
+    _refreshBiscuitStats();
     _startBiscuitBlinking();
+    _statsRefreshTimer = Timer.periodic(
+      const Duration(minutes: 1),
+      (_) => _refreshBiscuitStats(),
+    );
+
+    // Check the time every minute to see if we need to crossfade to a new background.
+    _denSceneTimer = Timer.periodic(
+      const Duration(minutes: 1),
+      (_) => _refreshDenScene(),
+    );
   }
 
-  // Load Biscuit's saved stats when the screen opens.
-  Future<void> _loadBiscuitStats() async {
+  String _getDenSceneForTime(DateTime time) {
+    final hour = time.hour;
+
+    // Morning: 5:00 AM to 10:59 AM
+    if (hour >= 5 && hour < 11) {
+      return 'assets/images/den_scene_morning.png';
+    }
+
+    // Afternoon: 11:00 AM to 3:59 PM
+    if (hour >= 11 && hour < 16) {
+      return 'assets/images/den_scene_afternoon.png';
+    }
+
+    // Evening: 4:00 PM to 6:59 PM
+    if (hour >= 16 && hour < 19) {
+      return 'assets/images/den_scene_evening.png';
+    }
+
+    // Night: 7:00 PM to 4:59 AM
+    return 'assets/images/den_scene.png';
+  }
+
+  void _refreshDenScene() {
+    if (!mounted) return;
+
+    final nextScene = _getDenSceneForTime(DateTime.now());
+
+    if (nextScene != _denSceneAsset) {
+      setState(() {
+        _denSceneAsset = nextScene;
+      });
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _refreshBiscuitStats();
+    }
+  }
+
+  int _readBoundedInt(
+    SharedPreferences prefs,
+    String key,
+    int fallback,
+    int maximum,
+  ) {
+    final value = prefs.get(key);
+    return value is int ? value.clamp(0, maximum) : fallback;
+  }
+
+  Future<void> _refreshBiscuitStats() {
+    if (_isUpdatingStats) return Future<void>.value();
+    final inFlight = _statsRefreshInFlight;
+    if (inFlight != null) return inFlight;
+
+    final refresh = _performStatsRefresh();
+    _statsRefreshInFlight = refresh;
+    return refresh.whenComplete(() {
+      if (identical(_statsRefreshInFlight, refresh)) {
+        _statsRefreshInFlight = null;
+      }
+    });
+  }
+
+  Future<void> _performStatsRefresh() async {
     try {
+      await _recoverExpiredFocusSession();
       final prefs = await SharedPreferences.getInstance();
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final storedEnergy = prefs.get(_energyKey);
+      final storedHappiness = prefs.get(_happinessKey);
+      final energy = storedEnergy is int ? storedEnergy.clamp(0, 100) : 100;
+      final happiness = storedHappiness is int
+          ? storedHappiness.clamp(0, 100)
+          : 90;
+      final treats = _readBoundedInt(prefs, _treatsKey, 5, 999);
+
+      final energyAnchor = _decayStat(
+        prefs,
+        anchorKey: _energyDecayAnchorKey,
+        value: energy,
+        intervalMs: _energyDecayIntervalMs,
+        nowMs: nowMs,
+      );
+      final happinessAnchor = _decayStat(
+        prefs,
+        anchorKey: _happinessDecayAnchorKey,
+        value: happiness,
+        intervalMs: _happinessDecayIntervalMs,
+        nowMs: nowMs,
+      );
+      final updatedEnergy = energyAnchor.value;
+      final updatedHappiness = happinessAnchor.value;
+
+      await _writeIntIfChanged(prefs, _energyKey, updatedEnergy);
+      await _writeIntIfChanged(prefs, _happinessKey, updatedHappiness);
+      await _writeIntIfChanged(
+        prefs,
+        _energyDecayAnchorKey,
+        energyAnchor.anchorMs,
+      );
+      await _writeIntIfChanged(
+        prefs,
+        _happinessDecayAnchorKey,
+        happinessAnchor.anchorMs,
+      );
+      await _writeIntIfChanged(prefs, _treatsKey, treats);
 
       if (!mounted) return;
 
-      setState(() {
-        _biscuitHappiness = (prefs.getInt(_happinessKey) ?? 90).clamp(0, 100);
-        _biscuitTreats = (prefs.getInt(_treatsKey) ?? 5).clamp(0, 999);
-        _isLoadingStats = false;
-      });
+      if (_biscuitHappiness != updatedHappiness ||
+          _biscuitEnergy != updatedEnergy ||
+          _biscuitTreats != treats ||
+          _isLoadingStats) {
+        setState(() {
+          _biscuitHappiness = updatedHappiness;
+          _biscuitEnergy = updatedEnergy;
+          _biscuitTreats = treats;
+          _isLoadingStats = false;
+        });
+      }
     } catch (error) {
       if (!mounted) return;
 
@@ -69,15 +210,76 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // Save Biscuit's stats on the device.
-  Future<void> _saveBiscuitStats() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
+  Future<void> _recoverExpiredFocusSession() {
+    final inFlight = _focusRecoveryInFlight;
+    if (inFlight != null) return inFlight;
 
-      await prefs.setInt(_happinessKey, _biscuitHappiness);
-      await prefs.setInt(_treatsKey, _biscuitTreats);
+    final recovery = _performFocusSessionRecovery();
+    _focusRecoveryInFlight = recovery;
+    return recovery.whenComplete(() {
+      if (identical(_focusRecoveryInFlight, recovery)) {
+        _focusRecoveryInFlight = null;
+      }
+    });
+  }
+
+  Future<void> _performFocusSessionRecovery() async {
+    try {
+      final session = await _focusSessionStore.load();
+      final sessionId = session.sessionId;
+      final endTimestampMs = session.endTimestampMs;
+      final isExpiredRunningSession =
+          session.isRunning &&
+          endTimestampMs != null &&
+          endTimestampMs <= DateTime.now().millisecondsSinceEpoch;
+      final hasPendingReward =
+          session.state == 'completed' && session.rewardPending;
+      if (sessionId == null ||
+          (!isExpiredRunningSession && !hasPendingReward)) {
+        return;
+      }
+
+      await _focusSessionStore.completeAndReward(sessionId);
     } catch (error) {
-      debugPrint('Could not save Biscuit stats: $error');
+      debugPrint('Could not recover expired focus session: $error');
+    }
+  }
+
+  ({int value, int anchorMs}) _decayStat(
+    SharedPreferences prefs, {
+    required String anchorKey,
+    required int value,
+    required int intervalMs,
+    required int nowMs,
+  }) {
+    final storedAnchor = prefs.get(anchorKey);
+    if (storedAnchor is! int || storedAnchor <= 0 || storedAnchor > nowMs) {
+      return (value: value, anchorMs: nowMs);
+    }
+
+    final elapsedMs = nowMs - storedAnchor;
+    final elapsedIntervals = elapsedMs ~/ intervalMs;
+    if (elapsedIntervals == 0) {
+      return (value: value, anchorMs: storedAnchor);
+    }
+
+    final nextValue = (value - elapsedIntervals).clamp(0, 100);
+    return (
+      value: nextValue,
+      anchorMs: storedAnchor + elapsedIntervals * intervalMs,
+    );
+  }
+
+  Future<void> _writeIntIfChanged(
+    SharedPreferences prefs,
+    String key,
+    int value,
+  ) async {
+    if (prefs.get(key) != value) {
+      final saved = await prefs.setInt(key, value);
+      if (!saved) {
+        throw StateError('SharedPreferences did not save $key.');
+      }
     }
   }
 
@@ -104,53 +306,144 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  // Pet Biscuit to increase her happiness.
-  void _petBiscuit() {
-    if (_isLoadingStats) return;
+  Future<void> _petBiscuit() async {
+    if (_isLoadingStats || _isUpdatingStats) return;
+    await _refreshBiscuitStats();
+    if (!mounted || _isUpdatingStats) return;
 
     setState(() {
-      _biscuitHappiness = (_biscuitHappiness + 3).clamp(0, 100);
-
-      _biscuitMessage = _biscuitHappiness >= 100
-          ? 'I am the happiest kitty! ❤️'
-          : 'Purr... I love that! ❤️';
+      _isUpdatingStats = true;
     });
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final happiness = (_biscuitHappiness + 3).clamp(0, 100);
+      await _writeIntIfChanged(prefs, _happinessKey, happiness);
 
-    _saveBiscuitStats();
+      if (!mounted) return;
+      setState(() {
+        _biscuitHappiness = happiness;
+        _biscuitMessage = happiness >= 100
+            ? 'I am the happiest kitty! ❤️'
+            : 'Purr... I love that! ❤️';
+      });
+    } catch (error) {
+      debugPrint('Could not save Biscuit pet interaction: $error');
+      if (mounted) {
+        setState(() {
+          _biscuitMessage = 'I could not save that just now. Please try again.';
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isUpdatingStats = false;
+        });
+      } else {
+        _isUpdatingStats = false;
+      }
+    }
   }
 
-  // Feed Biscuit using one available treat.
-  void _feedBiscuit() {
-    if (_isLoadingStats) return;
+  Future<void> _feedBiscuit() async {
+    if (_isLoadingStats || _isUpdatingStats) return;
+    await _refreshBiscuitStats();
+    if (!mounted || _isUpdatingStats) return;
 
-    if (_biscuitTreats <= 0) {
+    setState(() {
+      _isUpdatingStats = true;
+    });
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final treats = _readBoundedInt(prefs, _treatsKey, _biscuitTreats, 999);
+      if (treats <= 0) {
+        if (mounted) {
+          setState(() {
+            _biscuitMessage =
+                'Biscuit needs a treat earned through Focus Mode. 🐾';
+            _biscuitTreats = 0;
+          });
+        }
+        return;
+      }
+
+      final energy = (_biscuitEnergy + 35).clamp(0, 100);
+      final happiness = (_biscuitHappiness + 15).clamp(0, 100);
+      final remainingTreats = treats - 1;
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+
+      await _writeIntIfChanged(prefs, _energyKey, energy);
+      await _writeIntIfChanged(prefs, _happinessKey, happiness);
+      await _writeIntIfChanged(prefs, _energyDecayAnchorKey, nowMs);
+      await _writeIntIfChanged(prefs, _happinessDecayAnchorKey, nowMs);
+      await _writeIntIfChanged(prefs, _treatsKey, remainingTreats);
+
+      if (!mounted) return;
       setState(() {
-        _biscuitMessage = 'No treats left! Earn more by focusing. 🐾';
+        _biscuitEnergy = energy;
+        _biscuitHappiness = happiness;
+        _biscuitTreats = remainingTreats;
+        _biscuitMessage = 'Yummy! Thank you for the treat! 😻';
       });
-      return;
+    } catch (error) {
+      debugPrint('Could not save Biscuit feeding: $error');
+      if (mounted) {
+        setState(() {
+          _biscuitMessage =
+              'I could not save the treat just now. Please try again.';
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isUpdatingStats = false;
+        });
+      } else {
+        _isUpdatingStats = false;
+      }
+    }
+  }
+
+  Future<void> _openScreen(BuildContext context, Widget screen) async {
+    final Route<void> route;
+    if (screen is FocusScreen) {
+      route = PageRouteBuilder<void>(
+        transitionDuration: const Duration(milliseconds: 320),
+        reverseTransitionDuration: const Duration(milliseconds: 280),
+        pageBuilder: (context, _, _) => screen,
+        transitionsBuilder: (context, animation, _, child) {
+          final transition = CurvedAnimation(
+            parent: animation,
+            curve: Curves.easeOutCubic,
+          );
+          return FadeTransition(
+            opacity: transition,
+            child: SlideTransition(
+              position: Tween<Offset>(
+                begin: const Offset(0, 0.035),
+                end: Offset.zero,
+              ).animate(transition),
+              child: child,
+            ),
+          );
+        },
+      );
+    } else {
+      route = MaterialPageRoute<void>(builder: (_) => screen);
     }
 
-    setState(() {
-      _biscuitTreats--;
-
-      _biscuitHappiness = (_biscuitHappiness + 10).clamp(0, 100);
-
-      _biscuitMessage = _biscuitHappiness >= 100
-          ? 'Yummy! I am so happy! 😻'
-          : 'Yummy! Thank you! 😻';
-    });
-
-    _saveBiscuitStats();
-  }
-
-  void _openScreen(BuildContext context, Widget screen) {
-    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => screen));
+    await Navigator.of(context).push<void>(route);
+    if (mounted) {
+      await _refreshBiscuitStats();
+    }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _biscuitBlinkTimer?.cancel();
     _biscuitBlinkOffTimer?.cancel();
+    _denSceneTimer?.cancel();
+    _statsRefreshTimer?.cancel();
     super.dispose();
   }
 
@@ -235,38 +528,66 @@ class _HomeScreenState extends State<HomeScreen> {
                   child: Stack(
                     fit: StackFit.expand,
                     children: [
-                      Image.asset(
-                        'assets/images/den_scene.png',
-                        fit: BoxFit.cover,
-                        alignment: Alignment.center,
-                        errorBuilder: (context, error, stackTrace) {
-                          return Container(
-                            color: _panel,
-                            alignment: Alignment.center,
-                            padding: const EdgeInsets.all(20),
-                            child: const Column(
-                              mainAxisSize: MainAxisSize.min,
+                      // Time-based animated background
+                      Positioned.fill(
+                        child: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 1000),
+                          switchInCurve: Curves.easeInOut,
+                          switchOutCurve: Curves.easeInOut,
+                          layoutBuilder: (currentChild, previousChildren) {
+                            return Stack(
+                              fit: StackFit.expand,
                               children: [
-                                Icon(
-                                  Icons.image_not_supported_outlined,
-                                  color: _yellow,
-                                  size: 36,
-                                ),
-                                SizedBox(height: 10),
-                                Text(
-                                  'Den artwork not found',
-                                  style: TextStyle(color: _cream),
-                                ),
-                                SizedBox(height: 6),
-                                Text(
-                                  'Check assets/images/den_scene.png',
-                                  textAlign: TextAlign.center,
-                                  style: TextStyle(color: _muted, fontSize: 12),
-                                ),
+                                ...previousChildren,
+                                if (currentChild != null) currentChild,
                               ],
-                            ),
-                          );
-                        },
+                            );
+                          },
+                          child: Image.asset(
+                            _denSceneAsset,
+                            key: ValueKey<String>(_denSceneAsset),
+                            fit: BoxFit.cover,
+                            alignment: Alignment.center,
+                            errorBuilder: (context, error, stackTrace) {
+                              return Image.asset(
+                                'assets/images/den_scene.png',
+                                fit: BoxFit.cover,
+                                alignment: Alignment.center,
+                                errorBuilder: (context, err, stack) {
+                                  return Container(
+                                    color: _panel,
+                                    alignment: Alignment.center,
+                                    padding: const EdgeInsets.all(20),
+                                    child: const Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(
+                                          Icons.image_not_supported_outlined,
+                                          color: _yellow,
+                                          size: 36,
+                                        ),
+                                        SizedBox(height: 10),
+                                        Text(
+                                          'Den artwork not found',
+                                          style: TextStyle(color: _cream),
+                                        ),
+                                        SizedBox(height: 6),
+                                        Text(
+                                          'Check assets/images/den_scene.png',
+                                          textAlign: TextAlign.center,
+                                          style: TextStyle(
+                                            color: _muted,
+                                            fontSize: 12,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                },
+                              );
+                            },
+                          ),
+                        ),
                       ),
 
                       // Dark gradient overlay.
@@ -285,7 +606,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
 
                       // Biscuit's speech bubble, cat and name.
-                      // Keep bottom: 5 so Biscuit stays on the carpet.
+                      // Keep bottom: 35 so Biscuit stays on the carpet.
                       Positioned(
                         bottom: 35,
                         left: 25,
@@ -404,7 +725,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 children: [
                   Expanded(
                     child: OutlinedButton.icon(
-                      onPressed: _isLoadingStats ? null : _petBiscuit,
+                      onPressed: _isLoadingStats || _isUpdatingStats
+                          ? null
+                          : _petBiscuit,
                       icon: const Icon(Icons.favorite_rounded),
                       label: const Text('Pet Biscuit'),
                       style: OutlinedButton.styleFrom(
@@ -420,11 +743,15 @@ class _HomeScreenState extends State<HomeScreen> {
                   const SizedBox(width: 12),
                   Expanded(
                     child: ElevatedButton.icon(
-                      onPressed: _isLoadingStats ? null : _feedBiscuit,
+                      onPressed: _isLoadingStats || _isUpdatingStats
+                          ? null
+                          : _feedBiscuit,
                       icon: const Icon(Icons.restaurant_rounded),
                       label: Text(
                         _isLoadingStats
                             ? 'Loading...'
+                            : _isUpdatingStats
+                            ? 'Saving...'
                             : 'Feed ($_biscuitTreats)',
                       ),
                       style: ElevatedButton.styleFrom(
@@ -472,7 +799,11 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                         const SizedBox(width: 5),
                         Text(
-                          _biscuitHappiness >= 100
+                          _biscuitEnergy < 25
+                              ? 'Low energy'
+                              : _biscuitHappiness < 25
+                              ? 'Needs love'
+                              : _biscuitHappiness >= 100
                               ? 'Overjoyed'
                               : _biscuitHappiness >= 70
                               ? 'Happy'
@@ -489,7 +820,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
                     const SizedBox(height: 14),
 
-                    _statusBar('Energy', 0.8, _yellow),
+                    _statusBar('Energy', _biscuitEnergy / 100.0, _yellow),
 
                     const SizedBox(height: 12),
 

@@ -99,7 +99,12 @@ class _ProgressScreenState extends State<ProgressScreen> {
           return _ProgressTask(
             title: json['title'] as String? ?? '',
             priority: json['priority'] as String? ?? 'Medium',
-            isCompleted: json['isCompleted'] as bool? ?? false,
+            // Tasks screen stores the completion flag as 'completed'.
+            // Fall back to legacy 'isCompleted' for older data.
+            isCompleted:
+                (json['completed'] as bool?) ??
+                (json['isCompleted'] as bool?) ??
+                false,
             dueDate: DateTime.tryParse(json['dueDate'] as String? ?? ''),
           );
         }).toList();
@@ -181,6 +186,8 @@ class _ProgressScreenState extends State<ProgressScreen> {
                   physics: const AlwaysScrollableScrollPhysics(),
                   padding: const EdgeInsets.fromLTRB(20, 12, 20, 30),
                   children: [
+                    _buildProgressScene(),
+                    const SizedBox(height: 20),
                     _buildHeroCard(),
                     const SizedBox(height: 22),
                     _sectionTitle('Overview'),
@@ -236,6 +243,90 @@ class _ProgressScreenState extends State<ProgressScreen> {
                   ],
                 ),
               ),
+      ),
+    );
+  }
+
+  // Trophy Room illustration for the Progress page.
+  // Displays the cat-free 4:3 scene in a rounded card with a subtle
+  // shading gradient and a small TROPHY ROOM label.
+  Widget _buildProgressScene() {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(22),
+      child: AspectRatio(
+        aspectRatio: 4 / 3,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            Image.asset(
+              'assets/images/progress_scene.png',
+              fit: BoxFit.cover,
+              alignment: Alignment.center,
+              errorBuilder: (context, error, stackTrace) {
+                return const ColoredBox(
+                  color: Color(0xFF17132B),
+                  child: Center(
+                    child: Icon(
+                      Icons.image_not_supported_outlined,
+                      color: Color(0xFFFFD66B),
+                      size: 32,
+                    ),
+                  ),
+                );
+              },
+            ),
+
+            const DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    Color(0x44000000),
+                    Color(0x00000000),
+                    Color(0x55000000),
+                  ],
+                ),
+              ),
+            ),
+
+            Positioned(
+              left: 12,
+              top: 12,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF17132B).withValues(alpha: 0.90),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFF51466F)),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.emoji_events_rounded,
+                      color: Color(0xFFFFD66B),
+                      size: 16,
+                    ),
+                    SizedBox(width: 7),
+                    Text(
+                      'TROPHY ROOM',
+                      style: TextStyle(
+                        color: Color(0xFFFFD66B),
+                        fontSize: 10,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: 1,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
