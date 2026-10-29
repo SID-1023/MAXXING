@@ -177,11 +177,7 @@ class _CustomDurationDialogState extends State<_CustomDurationDialog> {
 }
 
 class FocusScreen extends StatefulWidget {
-  const FocusScreen({
-    super.key,
-    this.onStartSound,
-    this.onCompleteSound,
-  });
+  const FocusScreen({super.key, this.onStartSound, this.onCompleteSound});
 
   final Future<void> Function()? onStartSound;
   final Future<void> Function()? onCompleteSound;
@@ -193,6 +189,8 @@ class FocusScreen extends StatefulWidget {
 class _FocusScreenState extends State<FocusScreen>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   static const int _distractionNotificationId = 707;
+  static const int _questCompletionNotificationId = 708;
+  static const String _questCompletionChannelId = 'maxxing_quest_completion_v2';
   static const Color _portalViolet = Color(0xFF9D72FF);
   static const Color _portalLavender = Color(0xFFD4C2FF);
 
@@ -201,6 +199,7 @@ class _FocusScreenState extends State<FocusScreen>
   final FocusSessionStore _sessionStore = FocusSessionStore();
   Future<AudioPool?>? _portalAudioPool;
   Future<AudioPool?>? _completionAudioPool;
+  Future<void>? _notificationsInitialization;
   Future<void> _portalSoundQueue = Future<void>.value();
   StopFunction? _activePortalSoundStop;
   bool _isDisposed = false;
@@ -237,7 +236,9 @@ class _FocusScreenState extends State<FocusScreen>
   bool _guardEnabled = true;
   bool _notificationsReady = false;
   bool _notificationPermissionGranted = false;
+  bool _completionNotificationScheduled = false;
   bool _reminderShownForInterruption = false;
+  Future<void>? _questNotificationScheduling;
 
   int get _totalSeconds => _selectedMinutes * 60;
 
@@ -423,14 +424,17 @@ class _FocusScreenState extends State<FocusScreen>
             curve: const Interval(0.55, 1, curve: Curves.easeOutCubic),
           ),
         );
+    _notificationsInitialization = _initializeNotifications();
     unawaited(_restoreFocusSession());
-    _initializeNotifications();
   }
 
   Future<void> _restoreFocusSession() async {
-    if (_isRestoringSessionInFlight || _isDisposed) return;
+    if (_isRestoringSessionInFlight || _isDisposed || _isPersistingSession) {
+      return;
+    }
     _isRestoringSessionInFlight = true;
     try {
+      await _notificationsInitialization;
       final session = await _sessionStore.load();
       if (!mounted || _isDisposed) return;
 
@@ -463,9 +467,28 @@ class _FocusScreenState extends State<FocusScreen>
       });
 
       if (isRunning && remainingSeconds <= 0 && session.sessionId != null) {
-        _finishSession(sessionId: session.sessionId);
+        await _logQuestCompletionDeliveryState(session.sessionId!);
+        await _finishSession(sessionId: session.sessionId, playSound: false);
       } else if (_isRunning) {
         _endTime = DateTime.fromMillisecondsSinceEpoch(endTimestampMs!);
+        final hasPendingNotification =
+            await _hasPendingQuestCompletionNotification(session.sessionId!);
+        if (hasPendingNotification) {
+          _completionNotificationScheduled = true;
+        } else {
+          final wasDelivered = await _logQuestCompletionDeliveryState(
+            session.sessionId!,
+          );
+          if (wasDelivered) {
+            _completionNotificationScheduled = true;
+          } else {
+            await _scheduleQuestCompletionNotification(
+              session.sessionId!,
+              _endTime!,
+            );
+          }
+        }
+        if (!mounted || !_isRunning) return;
         _startTicking();
       } else if (_sessionCompleted && session.rewardPending) {
         await _completeFocusReward(session.sessionId);
@@ -515,20 +538,28 @@ class _FocusScreenState extends State<FocusScreen>
       tz.initializeTimeZones();
 
       const settings = InitializationSettings(
-        android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+        android: AndroidInitializationSettings('ic_maxxing_notification'),
       );
 
       await _notifications.initialize(
         settings: settings,
         onDidReceiveNotificationResponse: (response) {
+          debugPrint(
+            'Notification interaction: id=${response.id} '
+            'payload=${response.payload}.',
+          );
           if (!mounted || !context.mounted) return;
 
           final messenger = ScaffoldMessenger.maybeOf(context);
           if (messenger == null) return;
 
           messenger.showSnackBar(
-            const SnackBar(
-              content: Text('Welcome back! Your focus quest is waiting.'),
+            SnackBar(
+              content: Text(
+                response.payload?.startsWith('focus_quest_complete:') == true
+                    ? 'Quest complete! Biscuit is proud of you.'
+                    : 'Welcome back! Your focus quest is waiting.',
+              ),
             ),
           );
         },
@@ -539,14 +570,51 @@ class _FocusScreenState extends State<FocusScreen>
             AndroidFlutterLocalNotificationsPlugin
           >();
 
+      await android?.createNotificationChannel(
+        const AndroidNotificationChannel(
+          _questCompletionChannelId,
+          'Quest Completion',
+          description: 'Alerts when a Focus Quest timer finishes.',
+          importance: Importance.high,
+          sound: RawResourceAndroidNotificationSound('quest_complete'),
+          enableVibration: true,
+        ),
+      );
+
       final granted = await android?.requestNotificationsPermission();
+      final notificationsEnabled =
+          await android?.areNotificationsEnabled() ?? granted ?? true;
+      AndroidNotificationChannel? completionChannel;
+      try {
+        final channels = await android?.getNotificationChannels();
+        for (final channel
+            in channels ?? const <AndroidNotificationChannel>[]) {
+          if (channel.id == _questCompletionChannelId) {
+            completionChannel = channel;
+            break;
+          }
+        }
+      } catch (error) {
+        debugPrint('Could not inspect quest notification channel: $error');
+      }
 
       if (!mounted) return;
 
       setState(() {
         _notificationsReady = true;
-        _notificationPermissionGranted = granted ?? false;
+        _notificationPermissionGranted = notificationsEnabled;
       });
+      debugPrint(
+        'Quest notification channel: id=$_questCompletionChannelId '
+        'sound=${completionChannel?.sound?.sound ?? 'none'} '
+        'playSound=${completionChannel?.playSound} '
+        'vibration=${completionChannel?.enableVibration} '
+        'importance=${completionChannel?.importance}.',
+      );
+      debugPrint(
+        'Notification permission: requested=$granted '
+        'enabled=$notificationsEnabled.',
+      );
     } catch (error) {
       debugPrint('Notification initialization failed: $error');
     }
@@ -605,6 +673,7 @@ class _FocusScreenState extends State<FocusScreen>
             'Distraction Guard',
             channelDescription:
                 'Reminders to return to an active focus session.',
+            icon: 'ic_maxxing_notification',
             importance: Importance.high,
             priority: Priority.high,
           ),
@@ -616,6 +685,288 @@ class _FocusScreenState extends State<FocusScreen>
       debugPrint('MAXXING focus reminder scheduled.');
     } catch (error) {
       debugPrint('Could not schedule focus reminder: $error');
+    }
+  }
+
+  Future<void> _scheduleQuestCompletionNotification(
+    String sessionId,
+    DateTime endTime, {
+    bool requestExactAlarmAccess = false,
+  }) {
+    final scheduling = _registerQuestCompletionNotification(
+      sessionId,
+      endTime,
+      requestExactAlarmAccess: requestExactAlarmAccess,
+    );
+    _questNotificationScheduling = scheduling;
+    return scheduling;
+  }
+
+  Future<void> _registerQuestCompletionNotification(
+    String sessionId,
+    DateTime endTime, {
+    required bool requestExactAlarmAccess,
+  }) async {
+    if (_isDisposed) return;
+    if (!_notificationsReady) {
+      debugPrint(
+        'Focus quest completion notification skipped: notifications are not initialized.',
+      );
+      return;
+    }
+
+    final android = _notifications
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+    bool? notificationsEnabled;
+    try {
+      notificationsEnabled = await android?.areNotificationsEnabled();
+    } catch (error) {
+      _completionNotificationScheduled = false;
+      debugPrint(
+        'Could not verify notification permission for session '
+        '$sessionId; refusing to report successful scheduling: $error',
+      );
+      return;
+    }
+    if (notificationsEnabled == false || !_notificationPermissionGranted) {
+      _completionNotificationScheduled = false;
+      debugPrint(
+        'Quest notification not scheduled: notifications denied or disabled '
+        'for session $sessionId '
+        '(enabled=$notificationsEnabled, '
+        'permission=$_notificationPermissionGranted).',
+      );
+      return;
+    }
+
+    var canScheduleExactly = false;
+    try {
+      canScheduleExactly =
+          await android?.canScheduleExactNotifications() ?? false;
+      debugPrint(
+        'Exact alarm access: session=$sessionId available=$canScheduleExactly.',
+      );
+      if (!canScheduleExactly && requestExactAlarmAccess) {
+        final permissionRequest =
+            await android?.requestExactAlarmsPermission() ?? false;
+        canScheduleExactly =
+            await android?.canScheduleExactNotifications() ?? permissionRequest;
+        debugPrint(
+          'Exact alarm permission request: session=$sessionId '
+          'result=$permissionRequest availableAfterRequest=$canScheduleExactly.',
+        );
+      }
+      if (!canScheduleExactly) {
+        debugPrint(
+          'Exact alarm permission denied or unavailable for session '
+          '$sessionId; using inexactAllowWhileIdle.',
+        );
+      }
+    } catch (error) {
+      debugPrint('Exact alarm access check failed for $sessionId: $error');
+    }
+
+    final mode = canScheduleExactly
+        ? AndroidScheduleMode.exactAllowWhileIdle
+        : AndroidScheduleMode.inexactAllowWhileIdle;
+    _completionNotificationScheduled = false;
+    debugPrint(
+      'Quest notification scheduling started: session=$sessionId '
+      'end=${endTime.toIso8601String()} '
+      'epoch=${endTime.millisecondsSinceEpoch} '
+      'id=$_questCompletionNotificationId mode=${mode.name}.',
+    );
+    try {
+      await _replaceQuestCompletionNotification(sessionId, endTime, mode);
+      if (await _hasPendingQuestCompletionNotification(sessionId)) {
+        _completionNotificationScheduled = true;
+        debugPrint(
+          'Quest notification registered with Android: session=$sessionId '
+          'id=$_questCompletionNotificationId mode=${mode.name}; '
+          'pending is registration evidence, not delivery confirmation.',
+        );
+        return;
+      }
+      throw StateError(
+        'Android did not report the scheduled quest notification as pending.',
+      );
+    } catch (error) {
+      if (!canScheduleExactly) {
+        _completionNotificationScheduled = false;
+        debugPrint(
+          'Quest notification registration failed for session $sessionId '
+          '(id=$_questCompletionNotificationId, '
+          'end=${endTime.toIso8601String()}, mode=inexact): $error',
+        );
+        return;
+      }
+
+      debugPrint(
+        'Exact quest notification registration failed for session '
+        '$sessionId (id=$_questCompletionNotificationId, '
+        'end=${endTime.toIso8601String()}, mode=${mode.name}); '
+        'retrying inexactly: $error',
+      );
+      try {
+        await _replaceQuestCompletionNotification(
+          sessionId,
+          endTime,
+          AndroidScheduleMode.inexactAllowWhileIdle,
+        );
+        if (await _hasPendingQuestCompletionNotification(sessionId)) {
+          _completionNotificationScheduled = true;
+          debugPrint(
+            'Quest notification registered with Android: session=$sessionId '
+            'id=$_questCompletionNotificationId '
+            'mode=${AndroidScheduleMode.inexactAllowWhileIdle.name}; '
+            'pending is registration evidence, not delivery confirmation.',
+          );
+          return;
+        }
+        throw StateError(
+          'Android did not report the fallback quest notification as pending.',
+        );
+      } catch (fallbackError) {
+        _completionNotificationScheduled = false;
+        debugPrint(
+          'Quest notification fallback registration failed for session '
+          '$sessionId (id=$_questCompletionNotificationId, '
+          'end=${endTime.toIso8601String()}, mode=inexact): $fallbackError',
+        );
+      }
+    }
+  }
+
+  Future<void> _replaceQuestCompletionNotification(
+    String sessionId,
+    DateTime endTime,
+    AndroidScheduleMode mode,
+  ) async {
+    debugPrint(
+      'Replacing quest notification: session=$sessionId '
+      'id=$_questCompletionNotificationId mode=${mode.name}.',
+    );
+    await _notifications.cancel(id: _questCompletionNotificationId);
+    await _scheduleQuestCompletion(sessionId, endTime, mode: mode);
+    debugPrint(
+      'Quest notification requested: session=$sessionId '
+      'id=$_questCompletionNotificationId '
+      'end=${endTime.toIso8601String()} '
+      'epoch=${endTime.millisecondsSinceEpoch} '
+      'mode=${mode.name}.',
+    );
+  }
+
+  Future<bool> _hasPendingQuestCompletionNotification(String sessionId) async {
+    try {
+      final pendingRequests = await _notifications
+          .pendingNotificationRequests();
+      final isPending = pendingRequests.any(
+        (request) =>
+            request.id == _questCompletionNotificationId &&
+            request.payload == 'focus_quest_complete:$sessionId',
+      );
+      debugPrint(
+        'Quest notification registration check: session=$sessionId '
+        'id=$_questCompletionNotificationId pending=$isPending.',
+      );
+      return isPending;
+    } catch (error) {
+      debugPrint(
+        'Could not verify quest notification registration for session '
+        '$sessionId (id=$_questCompletionNotificationId): $error',
+      );
+      return false;
+    }
+  }
+
+  Future<bool> _logQuestCompletionDeliveryState(String sessionId) async {
+    try {
+      final activeNotifications = await _notifications.getActiveNotifications();
+      final isActive = activeNotifications.any(
+        (notification) =>
+            notification.id == _questCompletionNotificationId &&
+            notification.payload == 'focus_quest_complete:$sessionId',
+      );
+      debugPrint(
+        'Quest notification delivery check: session=$sessionId '
+        'id=$_questCompletionNotificationId '
+        'active=$isActive '
+        'result=${isActive ? 'posted_notification_observed' : 'not_observed'}.',
+      );
+      if (!isActive) {
+        debugPrint(
+          'No active quest notification observed for session $sessionId; '
+          'it may have been dismissed/cancelled or not delivered. '
+          'Android does not expose sound-suppression status through this API; '
+          'if repeated, inspect device battery/background restrictions.',
+        );
+      }
+      return isActive;
+    } catch (error) {
+      debugPrint(
+        'Could not inspect delivered quest notification for session '
+        '$sessionId: $error',
+      );
+      return false;
+    }
+  }
+
+  Future<void> _scheduleQuestCompletion(
+    String sessionId,
+    DateTime endTime, {
+    required AndroidScheduleMode mode,
+  }) {
+    return _notifications.zonedSchedule(
+      id: _questCompletionNotificationId,
+      title: 'Quest Complete! 🎉',
+      body:
+          'Time\'s up! Well done, Focus Warrior. '
+          'Biscuit is proud of you! 🐱',
+      scheduledDate: tz.TZDateTime.from(endTime, tz.local),
+      notificationDetails: const NotificationDetails(
+        android: AndroidNotificationDetails(
+          _questCompletionChannelId,
+          'Quest Completion',
+          channelDescription: 'Alerts when a Focus Quest timer finishes.',
+          icon: 'ic_maxxing_notification',
+          importance: Importance.high,
+          priority: Priority.high,
+          sound: RawResourceAndroidNotificationSound('quest_complete'),
+          enableVibration: true,
+        ),
+      ),
+      androidScheduleMode: mode,
+      payload: 'focus_quest_complete:$sessionId',
+    );
+  }
+
+  Future<void> _cancelQuestCompletionNotification({String? sessionId}) async {
+    final scheduling = _questNotificationScheduling;
+    if (scheduling != null) {
+      try {
+        await scheduling;
+      } catch (error) {
+        debugPrint(
+          'Quest notification scheduling failed before cancellation: $error',
+        );
+      }
+    }
+
+    try {
+      await _notifications.cancel(id: _questCompletionNotificationId);
+      debugPrint(
+        'Quest notification cancelled: session=${sessionId ?? _sessionId} '
+        'id=$_questCompletionNotificationId.',
+      );
+    } catch (error) {
+      debugPrint(
+        'Could not cancel focus quest completion notification: $error',
+      );
+    } finally {
+      _completionNotificationScheduled = false;
     }
   }
 
@@ -665,7 +1016,7 @@ class _FocusScreenState extends State<FocusScreen>
     final secondsLeft = _secondsUntil(end);
 
     if (secondsLeft <= 0) {
-      _finishSession();
+      unawaited(_finishSession());
     } else if (secondsLeft != _remainingSeconds) {
       setState(() => _remainingSeconds = secondsLeft);
     }
@@ -723,12 +1074,16 @@ class _FocusScreenState extends State<FocusScreen>
       _isRunning = true;
       _isSessionPaused = false;
       _sessionCompleted = false;
-      _isTransitioning = false;
       _isPersistingSession = false;
       _remainingSeconds = remainingSeconds;
     });
 
     _startTicking();
+    await _scheduleQuestCompletionNotification(
+      sessionId,
+      endTime,
+      requestExactAlarmAccess: true,
+    );
   }
 
   String _createSessionId() {
@@ -770,6 +1125,7 @@ class _FocusScreenState extends State<FocusScreen>
       _sessionCompleted = false;
     });
     _playPortalSound();
+    unawaited(_startTimer(newSession: true));
     unawaited(_playDimensionTransition());
   }
 
@@ -785,7 +1141,6 @@ class _FocusScreenState extends State<FocusScreen>
     setState(() {
       _isTransitioning = false;
     });
-    await _startTimer(newSession: true);
   }
 
   void _playPortalSound() {
@@ -899,7 +1254,7 @@ class _FocusScreenState extends State<FocusScreen>
     final secondsLeft = end == null ? _remainingSeconds : _secondsUntil(end);
 
     if (secondsLeft <= 0) {
-      _finishSession();
+      await _finishSession();
       return;
     }
 
@@ -929,8 +1284,13 @@ class _FocusScreenState extends State<FocusScreen>
         _isRunning = false;
         _isSessionPaused = true;
         _remainingSeconds = secondsLeft;
-        _isPersistingSession = false;
       });
+      await _cancelQuestCompletionNotification();
+      if (mounted) {
+        setState(() {
+          _isPersistingSession = false;
+        });
+      }
     } catch (error) {
       debugPrint('Could not persist paused focus session: $error');
       if (!mounted) return;
@@ -951,6 +1311,7 @@ class _FocusScreenState extends State<FocusScreen>
   Future<void> _resetTimer() async {
     if (_isCompletingSession || _isPersistingSession) return;
     final resetDuration = _selectedMinutes;
+    final resetSessionId = _sessionId;
 
     if (_isTransitioning) {
       _stopPortalSound();
@@ -977,6 +1338,7 @@ class _FocusScreenState extends State<FocusScreen>
     } catch (error) {
       debugPrint('Could not reset persisted focus session: $error');
     } finally {
+      await _cancelQuestCompletionNotification(sessionId: resetSessionId);
       if (mounted) {
         setState(() {
           _isPersistingSession = false;
@@ -995,6 +1357,7 @@ class _FocusScreenState extends State<FocusScreen>
       return;
     }
 
+    final previousSessionId = _sessionId;
     _timer?.cancel();
     _timer = null;
     _endTime = null;
@@ -1014,6 +1377,7 @@ class _FocusScreenState extends State<FocusScreen>
     } catch (error) {
       debugPrint('Could not persist selected focus duration: $error');
     } finally {
+      await _cancelQuestCompletionNotification(sessionId: previousSessionId);
       if (mounted) {
         setState(() {
           _isPersistingSession = false;
@@ -1042,7 +1406,10 @@ class _FocusScreenState extends State<FocusScreen>
     }
   }
 
-  void _finishSession({String? sessionId}) {
+  Future<void> _finishSession({
+    String? sessionId,
+    bool playSound = true,
+  }) async {
     final completedSessionId = sessionId ?? _sessionId;
     if (!mounted ||
         _sessionCompleted ||
@@ -1064,7 +1431,11 @@ class _FocusScreenState extends State<FocusScreen>
       _completedSessions++;
     });
 
-    _playCompletionSound();
+    if (playSound &&
+        (!_completionNotificationScheduled ||
+            !_notificationPermissionGranted)) {
+      _playCompletionSound();
+    }
     unawaited(_completeSessionReward(completedSessionId));
     _cancelDistractionReminder();
   }
@@ -1734,10 +2105,10 @@ class _FocusScreenState extends State<FocusScreen>
                     label: Text(
                       _isCompletingSession
                           ? 'SAVING REWARD'
-                          : _isRestoringSession || _isPersistingSession
-                          ? 'SAVING QUEST'
                           : _isTransitioning
                           ? 'ENTERING DIMENSION'
+                          : _isRestoringSession || _isPersistingSession
+                          ? 'SAVING QUEST'
                           : _isRunning
                           ? 'PAUSE QUEST'
                           : _isPaused

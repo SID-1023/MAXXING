@@ -15,7 +15,7 @@ void main() {
     expect(find.text('MAXXING'), findsWidgets);
   });
 
-  testWidgets('Focus timer starts after the dimension transition', (
+  testWidgets('Focus timer starts while the dimension transition plays', (
     WidgetTester tester,
   ) async {
     var soundPlayCount = 0;
